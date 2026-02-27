@@ -70,46 +70,42 @@ function checkNewVoiceNotesLocked_() {
   Logger.log("Cutoff: " + cutoff + " (" + (cutoff ? new Date(cutoff).toISOString() : "none") + ")");
   Logger.log("Folder IDs: " + JSON.stringify(config.folderIds));
 
-  // Collect new audio files across all folders
+  // Collect new audio files across all folders using Drive search API
   const newFiles = [];
+  const audioExtensions = [".mp3", ".m4a", ".ogg", ".wav", ".webm", ".aac", ".amr", ".3gp", ".mp4"];
+
+  // Build date filter for Drive query
+  const cutoffDate = cutoff > 0
+    ? " and createdDate > '" + new Date(cutoff).toISOString() + "'"
+    : "";
 
   for (const folderId of config.folderIds) {
-    let folder;
+    const query = "'" + folderId + "' in parents and trashed = false" + cutoffDate;
+    Logger.log("Searching: " + query);
+
+    let files;
     try {
-      folder = DriveApp.getFolderById(folderId);
+      files = DriveApp.searchFiles(query);
     } catch (e) {
-      Logger.log("Could not access folder " + folderId + ": " + e.message);
+      Logger.log("Could not search folder " + folderId + ": " + e.message);
       continue;
     }
 
-    Logger.log("Scanning folder: " + folder.getName() + " (" + folderId + ")");
     let scanned = 0;
-    let skippedMime = 0;
-    let skippedOld = 0;
-    const seenMimeTypes = new Set();
+    let matched = 0;
 
-    const audioExtensions = [".mp3", ".m4a", ".ogg", ".wav", ".webm", ".aac", ".amr", ".3gp", ".mp4"];
-
-    const files = folder.getFiles();
     while (files.hasNext()) {
       const file = files.next();
       scanned++;
       const mime = file.getMimeType();
       const name = file.getName().toLowerCase();
       const ext = name.substring(name.lastIndexOf("."));
-      const isAudio = audioMimeTypes.includes(mime) || audioExtensions.includes(ext);
-      seenMimeTypes.add(mime);
-      if (!isAudio) { skippedMime++; continue; }
-      const fileTime = file.getDateCreated().getTime();
-      if (fileTime <= cutoff) {
-        skippedOld++;
-        continue;
-      }
+      if (!audioMimeTypes.includes(mime) && !audioExtensions.includes(ext)) continue;
+      matched++;
       newFiles.push(file);
     }
 
-    Logger.log("  " + scanned + " files scanned, " + skippedMime + " non-audio, " + skippedOld + " older than cutoff, " + (scanned - skippedMime - skippedOld) + " new");
-    Logger.log("  MIME types seen: " + [...seenMimeTypes].join(", "));
+    Logger.log("  " + scanned + " files from Drive, " + matched + " audio matches");
   }
 
   // Sort newest first
@@ -233,12 +229,14 @@ Rules:
 - Limit to 5 levels of nesting
 - Each list item begins with "-" and each indentation level is 2 spaces
 - Do not write any text not in a list item
-- The only markdown syntax allowed: "-"-style unordered lists and **bold**
+- The only markdown syntax allowed: "-"-style unordered lists, **bold**, and [[double bracket tags]]
 - Do not use headings, paragraphs, or other markdown
 - Maintain first person voice if used
+- Preserve original meaning faithfully — do not editorialize or add information
 - Don't prefix the response (no "Sure, here is..." etc.)
-
-If the transcription contains a request/instruction, include the cleaned up transcription first, then include the answer after two blank lines.`;
+- Tag people, projects, and notable topics with [[double brackets]] inline (e.g. [[John]], [[Project Alpha]])
+- If there are action items, TODOs, or commitments mentioned, add a final top-level bullet "- **Action items:**" with each action as a nested bullet
+- You are Claudia. The transcript may contain phrases addressed to "Claudia" — these are instructions to you. Keep them in the transcribed output as-is, but also follow them. Append your responses under a top-level bullet "- **Claudia:**" at the end, after the full transcription.`;
 
   const payload = {
     model: "claude-sonnet-4-6",
