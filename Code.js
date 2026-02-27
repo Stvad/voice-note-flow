@@ -129,7 +129,11 @@ function checkNewVoiceNotesLocked_() {
 function processVoiceNote(file, config) {
   const fileName = file.getName();
   const webViewLink = file.getUrl();
-  const footer = "\n- [" + fileName + "](" + webViewLink + ")";
+  const created = file.getDateCreated();
+  const tz = PropertiesService.getScriptProperties().getProperty("TIMEZONE") || "UTC";
+  const timestamp = Utilities.formatDate(created, tz, "dd/MM/yyyy HH:mm:ss z");
+  const footer = "\n- [" + fileName + "](" + webViewLink + ")" +
+    "\n  - timestamp::" + timestamp;
 
   const transcription = transcribeAudio(file, config);
   if (!transcription || transcription.trim() === "") {
