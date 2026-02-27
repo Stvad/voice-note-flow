@@ -229,7 +229,7 @@ Rules:
 - Limit to 5 levels of nesting
 - Each list item begins with "-" and each indentation level is 2 spaces
 - Do not write any text not in a list item
-- The only markdown syntax allowed: "-"-style unordered lists, **bold**, and [[double bracket tags]]
+- The only markdown syntax allowed: "-"-style unordered lists + any inline formatting like **bold**, and [[double bracket tags]]
 - Do not use headings, paragraphs, or other markdown
 - Maintain first person voice if used
 - Preserve original meaning faithfully — do not editorialize or add information
