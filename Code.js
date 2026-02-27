@@ -67,6 +67,9 @@ function checkNewVoiceNotesLocked_() {
     "audio/amr", "audio/3gpp", "video/mp4",
   ];
 
+  Logger.log("Cutoff: " + cutoff + " (" + (cutoff ? new Date(cutoff).toISOString() : "none") + ")");
+  Logger.log("Folder IDs: " + JSON.stringify(config.folderIds));
+
   // Collect new audio files across all folders
   const newFiles = [];
 
@@ -79,13 +82,34 @@ function checkNewVoiceNotesLocked_() {
       continue;
     }
 
+    Logger.log("Scanning folder: " + folder.getName() + " (" + folderId + ")");
+    let scanned = 0;
+    let skippedMime = 0;
+    let skippedOld = 0;
+    const seenMimeTypes = new Set();
+
+    const audioExtensions = [".mp3", ".m4a", ".ogg", ".wav", ".webm", ".aac", ".amr", ".3gp", ".mp4"];
+
     const files = folder.getFiles();
     while (files.hasNext()) {
       const file = files.next();
-      if (!audioMimeTypes.includes(file.getMimeType())) continue;
-      if (file.getDateCreated().getTime() <= cutoff) continue;
+      scanned++;
+      const mime = file.getMimeType();
+      const name = file.getName().toLowerCase();
+      const ext = name.substring(name.lastIndexOf("."));
+      const isAudio = audioMimeTypes.includes(mime) || audioExtensions.includes(ext);
+      seenMimeTypes.add(mime);
+      if (!isAudio) { skippedMime++; continue; }
+      const fileTime = file.getDateCreated().getTime();
+      if (fileTime <= cutoff) {
+        skippedOld++;
+        continue;
+      }
       newFiles.push(file);
     }
+
+    Logger.log("  " + scanned + " files scanned, " + skippedMime + " non-audio, " + skippedOld + " older than cutoff, " + (scanned - skippedMime - skippedOld) + " new");
+    Logger.log("  MIME types seen: " + [...seenMimeTypes].join(", "));
   }
 
   // Sort newest first
