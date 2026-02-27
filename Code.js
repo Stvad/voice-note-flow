@@ -74,9 +74,9 @@ function checkNewVoiceNotesLocked_() {
   const newFiles = [];
   const audioExtensions = [".mp3", ".m4a", ".ogg", ".wav", ".webm", ".aac", ".amr", ".3gp", ".mp4"];
 
-  // Build date filter for Drive query
+  // Build date filter for Drive query (createdDate not supported by DriveApp, use modifiedDate)
   const cutoffDate = cutoff > 0
-    ? " and createdDate > '" + new Date(cutoff).toISOString() + "'"
+    ? " and modifiedDate > '" + new Date(cutoff).toISOString() + "'"
     : "";
 
   for (const folderId of config.folderIds) {
@@ -120,7 +120,7 @@ function checkNewVoiceNotesLocked_() {
     try {
       const result = processVoiceNote(file, config);
       sendMatrixMessage(result, config);
-      Logger.log("Sent to Matrix: " + file.getName());
+      Logger.log("Sent to Matrix: " + file.getName() + "\n" + result);
     } catch (e) {
       Logger.log("Error processing " + file.getName() + ": " + e.message);
     }
