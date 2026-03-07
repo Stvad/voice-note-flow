@@ -60,6 +60,8 @@ function checkNewVoiceNotesLocked_() {
   const props = PropertiesService.getScriptProperties();
   const cutoff = Number(props.getProperty("LAST_PROCESSED_TIME") || "0");
   const initialLimit = Number(props.getProperty("INITIAL_LIMIT") || "1");
+  const recentIds = JSON.parse(props.getProperty("RECENT_FILE_IDS") || "[]");
+  const recentSet = new Set(recentIds);
 
   const audioMimeTypes = [
     "audio/mpeg", "audio/mp4", "audio/m4a", "audio/ogg",
@@ -69,6 +71,7 @@ function checkNewVoiceNotesLocked_() {
 
   Logger.log("Cutoff: " + cutoff + " (" + (cutoff ? new Date(cutoff).toISOString() : "none") + ")");
   Logger.log("Folder IDs: " + JSON.stringify(config.folderIds));
+  Logger.log("Recent IDs tracked: " + recentIds.length);
 
   // Collect new audio files across all folders using Drive search API
   const newFiles = [];
@@ -97,6 +100,7 @@ function checkNewVoiceNotesLocked_() {
     while (files.hasNext()) {
       const file = files.next();
       scanned++;
+      if (recentSet.has(file.getId())) continue;
       const mime = file.getMimeType();
       const name = file.getName().toLowerCase();
       const ext = name.substring(name.lastIndexOf("."));
@@ -105,11 +109,11 @@ function checkNewVoiceNotesLocked_() {
       newFiles.push(file);
     }
 
-    Logger.log("  " + scanned + " files from Drive, " + matched + " audio matches");
+    Logger.log("  " + scanned + " files from Drive, " + matched + " new audio matches");
   }
 
-  // Sort newest first
-  newFiles.sort((a, b) => b.getDateCreated().getTime() - a.getDateCreated().getTime());
+  // Sort newest first by modification time (consistent with query filter)
+  newFiles.sort((a, b) => b.getLastUpdated().getTime() - a.getLastUpdated().getTime());
 
   // If no cutoff yet (first run), limit to initialLimit most recent
   const filesToProcess = cutoff === 0 ? newFiles.slice(0, initialLimit) : newFiles;
@@ -125,21 +129,27 @@ function checkNewVoiceNotesLocked_() {
       Logger.log("Error processing " + file.getName() + ": " + e.message);
     }
 
-    // Update cutoff after each file
-    const fileTime = file.getDateCreated().getTime();
+    // Update cutoff using modifiedDate (consistent with Drive query)
+    const fileTime = file.getLastUpdated().getTime();
     if (fileTime > cutoff) {
       props.setProperty("LAST_PROCESSED_TIME", String(fileTime));
     }
+
+    // Track file ID to prevent reprocessing on re-upload
+    recentSet.add(file.getId());
   }
 
-  // If first run and we limited, set cutoff to the newest file in the folder
-  // so older files are never picked up
+  // If first run and we limited, set cutoff to the newest file across all results
   if (cutoff === 0 && newFiles.length > 0) {
-    const newestTime = newFiles[0].getDateCreated().getTime();
+    const newestTime = newFiles[0].getLastUpdated().getTime();
     props.setProperty("LAST_PROCESSED_TIME", String(newestTime));
   }
 
+  // Save recent IDs (keep last 50 to avoid unbounded growth)
   if (filesToProcess.length > 0) {
+    const allIds = [...recentSet];
+    const trimmed = allIds.slice(Math.max(0, allIds.length - 50));
+    props.setProperty("RECENT_FILE_IDS", JSON.stringify(trimmed));
     Logger.log("Processed " + filesToProcess.length + " files this run.");
   }
 }
@@ -329,6 +339,7 @@ function resetProcessedFiles() {
   const props = PropertiesService.getScriptProperties();
   props.deleteProperty("PROCESSED_FILE_IDS");
   props.deleteProperty("LAST_PROCESSED_TIME");
+  props.deleteProperty("RECENT_FILE_IDS");
   Logger.log("Cleared processed file history. Next run will process only the " +
     (props.getProperty("INITIAL_LIMIT") || "1") + " most recent file(s), then track from there.");
 }
