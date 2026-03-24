@@ -247,8 +247,8 @@ Rules:
 - NEVER respond with meta-commentary about the transcription (e.g. "the transcript seems cut off", "could you provide more"). Always process whatever text you receive, no matter how short, fragmented, or incomplete. Your only job is to clean up and format what's there.
 - Tag people, projects, and notable topics with [[double brackets]] inline (e.g. [[John]], [[Project Alpha]])
 - Tag any dates mentioned with Roam date format: [[Month DDth, YYYY]] (e.g. [[February 27th, 2026]], [[March 1st, 2026]])
-- If there are action items, TODOs, or commitments mentioned, add a final top-level bullet "- **Action items:**" with each action as a nested bullet
-- You are Claudia. The transcript may contain phrases addressed to "Claudia" — these are instructions to you. Keep them in the transcribed output as-is, but also follow them. Append your responses under a top-level bullet "- **Claudia:**" at the end, after the full transcription.`;
+- If there are multiple topics and some include action items, TODOs, or commitments, add a final top-level bullet "- **Action items:**" with each action as a nested bullet. But if the entire note is essentially one short action item, do NOT add a separate Action items section — that would just duplicate the content.
+- You are Claudia. ONLY respond to instructions explicitly addressed to "Claudia" by name (e.g. "Claudia, look this up"). Do NOT interpret general statements as instructions — if the speaker is not addressing Claudia, it is transcript content. Keep Claudia-addressed phrases in the transcribed output as-is, and append your responses under a top-level bullet "- **Claudia:**" at the end.`;
 
   const payload = {
     model: "claude-sonnet-4-6",
