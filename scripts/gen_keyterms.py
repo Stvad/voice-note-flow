@@ -10,7 +10,11 @@ Heuristic:
   LINK list  : dedupe by block_id, drop pure noise (single-char/symbol
                aliases), drop comma-bearing aliases (would break our
                comma-separated config), drop explicit generics.
-               Threshold: usage >= --threshold (default 12).
+               Threshold: usage >= --threshold (default 12). The list is
+               then trimmed from the lowest-usage end until its joined
+               UTF-8 size fits under --max-link-bytes (default 8800).
+               Apps Script PropertiesService caps individual values at 9KB
+               and silently drops oversized writes.
   ACOUSTIC   : tight subset for transcription boost — personal names,
                unusual proper nouns, distinctive jargon. Filters out
                two-word "name" candidates whose tokens are all common
@@ -114,8 +118,19 @@ def is_likely_personal_name(s: str) -> bool:
     return True
 
 
-def build_lists(entries, threshold: int):
-    link_terms = [a for (a, u) in entries if u >= threshold]
+def build_lists(entries, threshold: int, max_link_bytes: int):
+    # Initial filter by usage threshold
+    candidates = [(a, u) for (a, u) in entries if u >= threshold]
+    # Apps Script PropertiesService caps each value at 9KB (per
+    # https://developers.google.com/apps-script/guides/services/quotas)
+    # and silently truncates oversized writes. Trim from the bottom
+    # (lowest usage first, since `entries` is sorted desc) until we fit.
+    def joined_bytes(items):
+        return len(",".join(a for a, _ in items).encode("utf-8"))
+    while candidates and joined_bytes(candidates) > max_link_bytes:
+        candidates.pop()
+    link_terms = [a for (a, _) in candidates]
+    effective_threshold = candidates[-1][1] if candidates else None
 
     acoustic, seen = [], set()
     # Pass 1: high-usage personal names that aren't common English phrases
@@ -130,7 +145,7 @@ def build_lists(entries, threshold: int):
             acoustic.append(alias); seen.add(alias)
     acoustic = acoustic[:95]
 
-    return link_terms, acoustic
+    return link_terms, acoustic, effective_threshold
 
 
 def main():
@@ -138,6 +153,9 @@ def main():
     p.add_argument("csv", type=Path, help="Path to the Roam alias CSV dump")
     p.add_argument("--threshold", type=int, default=12,
                    help="Min usage_count for LINK list inclusion (default 12)")
+    p.add_argument("--max-link-bytes", type=int, default=8800,
+                   help="Max UTF-8 byte size of joined LINK list (default 8800; "
+                        "Apps Script per-value cap is 9KB)")
     p.add_argument("--out-dir", type=Path, default=Path.cwd(),
                    help="Output directory (default: cwd)")
     args = p.parse_args()
@@ -159,7 +177,8 @@ def main():
                 by_block[block_id] = (alias, usage)
 
     entries = sorted(by_block.values(), key=lambda x: -x[1])
-    link_terms, acoustic = build_lists(entries, args.threshold)
+    link_terms, acoustic, effective_threshold = build_lists(
+        entries, args.threshold, args.max_link_bytes)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     link_path = args.out_dir / "keyterms_link.txt"
@@ -167,8 +186,9 @@ def main():
     link_path.write_text(",".join(link_terms))
     acoustic_path.write_text(",".join(acoustic))
 
+    eff = f" (effective usage cutoff: {effective_threshold})" if effective_threshold else ""
     print(f"LINK list:     {len(link_terms):>4} entries -> {link_path} "
-          f"({link_path.stat().st_size} bytes)", file=sys.stderr)
+          f"({link_path.stat().st_size} bytes{eff})", file=sys.stderr)
     print(f"ACOUSTIC list: {len(acoustic):>4} entries -> {acoustic_path} "
           f"({acoustic_path.stat().st_size} bytes)", file=sys.stderr)
 
