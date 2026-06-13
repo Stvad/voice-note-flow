@@ -9,15 +9,21 @@
 
 function getConfig() {
   const props = PropertiesService.getScriptProperties();
+  const splitList = (s) => (s || "").split(",").map(x => x.trim()).filter(Boolean);
   return {
     deepgramKey: props.getProperty("DEEPGRAM_API_KEY"),
     anthropicKey: props.getProperty("ANTHROPIC_API_KEY"),
     matrixAccessToken: props.getProperty("MATRIX_ACCESS_TOKEN"),
     matrixRoomId: props.getProperty("MATRIX_ROOM_ID"),
     // Comma-separated folder IDs to watch
-    folderIds: (props.getProperty("FOLDER_IDS") || "").split(",").map(s => s.trim()).filter(Boolean),
-    // Comma-separated keyterms (names, projects, jargon) for transcription + post-processing
-    keyterms: (props.getProperty("KEYTERMS") || "").split(",").map(s => s.trim()).filter(Boolean),
+    folderIds: splitList(props.getProperty("FOLDER_IDS")),
+    // KEYTERMS: canonical names/projects/topics used for Claude auto-linking
+    // (can be large — only items in this list get [[bracketed]])
+    keyterms: splitList(props.getProperty("KEYTERMS")),
+    // ACOUSTIC_KEYTERMS: focused subset sent to Deepgram for transcription
+    // boost. Optional — if empty, falls back to first 95 of KEYTERMS.
+    // Deepgram Nova-3 caps at 100 keyterms per request.
+    acousticKeyterms: splitList(props.getProperty("ACOUSTIC_KEYTERMS")),
   };
 }
 
@@ -192,8 +198,11 @@ function processVoiceNote(file, config) {
 function transcribeAudio(file, config) {
   const blob = file.getBlob();
 
+  const acoustic = config.acousticKeyterms.length > 0
+    ? config.acousticKeyterms
+    : config.keyterms.slice(0, 95);
   const params = ["model=nova-3", "smart_format=true"];
-  for (const term of config.keyterms) {
+  for (const term of acoustic) {
     params.push("keyterm=" + encodeURIComponent(term));
   }
   const url = "https://api.deepgram.com/v1/listen?" + params.join("&");
@@ -243,6 +252,7 @@ Rules:
 - NEVER respond with meta-commentary about the transcription (e.g. "the transcript seems cut off", "could you provide more"). Always process whatever text you receive, no matter how short, fragmented, or incomplete. Your only job is to clean up and format what's there.
 - Auto-link with [[double brackets]] ONLY for terms from the "Known terms" list below. Do not bracket any other names, projects, or topics — leave them as plain text.
 - Fuzzy match: a partial or mistranscribed mention should still link to the canonical list entry. E.g. if the speaker says "Bobby" and the list contains "Bobby Smith", output [[Bobby Smith]]. If multiple list entries could plausibly match, pick the first one in list order.
+- Hierarchical entries (slashes, e.g. "wcs/whip", "to/buy", "Roam/garden") may be matched either from the full form ("to buy", "wcs whip") OR from the base/last segment ("whip", "buy") WHEN context makes the domain unambiguous — e.g. "whip" → [[wcs/whip]] inside a passage about swing dancing; "to buy" → [[to/buy]] when expressing a buying intent. If context is ambiguous (e.g. "whip" in a cooking discussion), leave it as plain text.
 - Only bracket the FIRST occurrence of each matched term in the note; subsequent mentions of the same term stay as plain text (use whatever the speaker actually said).
 - Tag any dates mentioned with Roam date format: [[Month DDth, YYYY]] (e.g. [[February 27th, 2026]], [[March 1st, 2026]]). This rule applies regardless of the Known terms list, and applies to every date mention (not just the first).
 - If there are multiple topics and some include action items, TODOs, or commitments, add a final top-level bullet "- **Action items:**" with each action as a nested bullet. But if the entire note is essentially one short action item, do NOT add a separate Action items section — that would just duplicate the content.
