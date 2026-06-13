@@ -34,6 +34,7 @@ import argparse
 import csv
 import re
 import sys
+import urllib.parse
 from pathlib import Path
 
 # Always drop
@@ -143,9 +144,19 @@ def build_lists(entries, threshold: int, max_link_bytes: int):
     for alias in DISTINCTIVE_SINGLES_OR_PHRASES:
         if alias not in seen:
             acoustic.append(alias); seen.add(alias)
+    # Cap by both Deepgram's 100-keyterm limit AND Apps Script's 2KB URL cap.
+    # Each acoustic term contributes len("&keyterm=") + urlencoded length to
+    # the Deepgram request URL (base ~64 chars). 1900 leaves a safety margin.
     acoustic = acoustic[:95]
+    KEY_PREFIX = len("&keyterm=")
+    url_budget = 1900
+    fit, used = [], 0
+    for term in acoustic:
+        cost = KEY_PREFIX + len(urllib.parse.quote(term, safe=""))
+        if used + cost > url_budget: break
+        fit.append(term); used += cost
 
-    return link_terms, acoustic, effective_threshold
+    return link_terms, fit, effective_threshold
 
 
 def main():

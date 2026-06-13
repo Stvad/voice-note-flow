@@ -198,14 +198,24 @@ function processVoiceNote(file, config) {
 function transcribeAudio(file, config) {
   const blob = file.getBlob();
 
+  // Apps Script UrlFetchApp caps URLs at 2KB. Build the URL incrementally and
+  // stop appending keyterms once we get close to the limit.
+  const URL_LIMIT = 2000;
+  const base = "https://api.deepgram.com/v1/listen?model=nova-3&smart_format=true";
   const acoustic = config.acousticKeyterms.length > 0
     ? config.acousticKeyterms
     : config.keyterms.slice(0, 95);
-  const params = ["model=nova-3", "smart_format=true"];
+  let url = base;
+  let included = 0;
   for (const term of acoustic) {
-    params.push("keyterm=" + encodeURIComponent(term));
+    const next = url + "&keyterm=" + encodeURIComponent(term);
+    if (next.length > URL_LIMIT) break;
+    url = next;
+    included++;
   }
-  const url = "https://api.deepgram.com/v1/listen?" + params.join("&");
+  if (included < acoustic.length) {
+    Logger.log("URL length cap: sent " + included + "/" + acoustic.length + " keyterms to Deepgram");
+  }
 
   const response = UrlFetchApp.fetch(url, {
     method: "post",
