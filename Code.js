@@ -10,14 +10,12 @@
 function getConfig() {
   const props = PropertiesService.getScriptProperties();
   return {
-    deepgramKey: props.getProperty("DEEPGRAM_API_KEY"),
+    openaiKey: props.getProperty("OPENAI_API_KEY"),
     anthropicKey: props.getProperty("ANTHROPIC_API_KEY"),
     matrixAccessToken: props.getProperty("MATRIX_ACCESS_TOKEN"),
     matrixRoomId: props.getProperty("MATRIX_ROOM_ID"),
     // Comma-separated folder IDs to watch
     folderIds: (props.getProperty("FOLDER_IDS") || "").split(",").map(s => s.trim()).filter(Boolean),
-    // Comma-separated keyterms (names, projects, jargon) for transcription + post-processing
-    keyterms: (props.getProperty("KEYTERMS") || "").split(",").map(s => s.trim()).filter(Boolean),
   };
 }
 
@@ -187,45 +185,63 @@ function processVoiceNote(file, config) {
   return body + footer;
 }
 
-// --- Step 1: Transcribe with Deepgram Nova-3 ---
+// --- Step 1: Transcribe with gpt-4o-transcribe ---
 
 function transcribeAudio(file, config) {
   const blob = file.getBlob();
+  const fileName = file.getName();
 
-  const params = ["model=nova-3", "smart_format=true"];
-  for (const term of config.keyterms) {
-    params.push("keyterm=" + encodeURIComponent(term));
-  }
-  const url = "https://api.deepgram.com/v1/listen?" + params.join("&");
+  // Build multipart/form-data payload
+  const boundary = "----VoiceNoteFormBoundary" + Utilities.getUuid();
 
-  const response = UrlFetchApp.fetch(url, {
+  const parts = [];
+
+  // model field
+  parts.push(
+    "--" + boundary + "\r\n" +
+    'Content-Disposition: form-data; name="model"\r\n\r\n' +
+    "gpt-4o-transcribe\r\n"
+  );
+
+  // file field
+  parts.push(
+    "--" + boundary + "\r\n" +
+    'Content-Disposition: form-data; name="file"; filename="' + fileName + '"\r\n' +
+    "Content-Type: " + blob.getContentType() + "\r\n\r\n"
+  );
+
+  const closing = "\r\n--" + boundary + "--\r\n";
+
+  // Assemble as byte array
+  const preBytes = Utilities.newBlob(parts.join("")).getBytes();
+  const fileBytes = blob.getBytes();
+  const closingBytes = Utilities.newBlob(closing).getBytes();
+
+  const payload = [...preBytes, ...fileBytes, ...closingBytes];
+
+  const response = UrlFetchApp.fetch("https://api.openai.com/v1/audio/transcriptions", {
     method: "post",
     headers: {
-      "Authorization": "Token " + config.deepgramKey,
+      "Authorization": "Bearer " + config.openaiKey,
     },
-    contentType: blob.getContentType(),
-    payload: blob.getBytes(),
+    contentType: "multipart/form-data; boundary=" + boundary,
+    payload: payload,
     muteHttpExceptions: true,
   });
 
   const code = response.getResponseCode();
   if (code !== 200) {
-    throw new Error("Deepgram transcription failed (" + code + "): " + response.getContentText());
+    throw new Error("OpenAI transcription failed (" + code + "): " + response.getContentText());
   }
 
   const result = JSON.parse(response.getContentText());
-  const transcript = result.results.channels[0].alternatives[0].transcript;
-  Logger.log("Raw transcript:\n" + transcript);
-  return transcript;
+  Logger.log('Raw transcript:\n' + result.text)
+  return result.text;
 }
 
 // --- Step 2: Post-process with Claude ---
 
 function postProcess(transcription, config) {
-  const keytermsSection = config.keyterms.length > 0
-    ? `\n\nKnown people, projects, and topics that recur in these notes (the transcriber may still mishear them — when a word in the transcript is phonetically close to one of these and the context fits, correct it):\n${config.keyterms.map(t => `- ${t}`).join("\n")}`
-    : "";
-
   const systemPrompt = `You are a transcription post-processor. You clean up voice note transcriptions and format them as hierarchical bulleted lists.
 
 Rules:
@@ -244,7 +260,7 @@ Rules:
 - Tag people, projects, and notable topics with [[double brackets]] inline (e.g. [[John]], [[Project Alpha]])
 - Tag any dates mentioned with Roam date format: [[Month DDth, YYYY]] (e.g. [[February 27th, 2026]], [[March 1st, 2026]])
 - If there are multiple topics and some include action items, TODOs, or commitments, add a final top-level bullet "- **Action items:**" with each action as a nested bullet. But if the entire note is essentially one short action item, do NOT add a separate Action items section — that would just duplicate the content.
-- You are Claudia. ONLY respond to instructions explicitly addressed to "Claudia" by name (e.g. "Claudia, look this up"). Do NOT interpret general statements as instructions — if the speaker is not addressing Claudia, it is transcript content. Keep Claudia-addressed phrases in the transcribed output as-is, and append your responses under a top-level bullet "- **Claudia:**" at the end.${keytermsSection}`;
+- You are Claudia. ONLY respond to instructions explicitly addressed to "Claudia" by name (e.g. "Claudia, look this up"). Do NOT interpret general statements as instructions — if the speaker is not addressing Claudia, it is transcript content. Keep Claudia-addressed phrases in the transcribed output as-is, and append your responses under a top-level bullet "- **Claudia:**" at the end.`;
 
   const payload = {
     model: "claude-sonnet-4-6",
