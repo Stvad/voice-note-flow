@@ -156,21 +156,33 @@ function checkNewVoiceNotesLocked_() {
 
 // --- Process a single voice note ---
 
+const SUMMARY_THRESHOLD_CHARS = 1000;
+
 function processVoiceNote(file, config) {
   const fileName = file.getName();
   const webViewLink = file.getUrl();
   const created = file.getDateCreated();
   const tz = PropertiesService.getScriptProperties().getProperty("TIMEZONE") || "UTC";
   const timestamp = Utilities.formatDate(created, tz, "dd/MM/yyyy HH:mm:ss z");
-  const footer = "\n- [" + fileName + "](" + webViewLink + ")" +
-    "\n  - timestamp::" + timestamp;
+  const footer = "\n- audio-url::" + webViewLink +
+    "\n- audio-file-name::" + fileName +
+    "\n- timestamp::" + timestamp;
 
   const transcription = transcribeAudio(file, config);
   if (!transcription || transcription.trim() === "") {
     return "- [[no speech detected]]" + footer;
   }
   const processed = postProcess(transcription, config);
-  return processed + footer;
+
+  let body;
+  if (processed.length > SUMMARY_THRESHOLD_CHARS) {
+    const summary = summarize(processed, config);
+    const indented = processed.split("\n").map(l => l.length > 0 ? "  " + l : l).join("\n");
+    body = "- " + summary + "\n" + indented;
+  } else {
+    body = processed;
+  }
+  return body + footer;
 }
 
 // --- Step 1: Transcribe with gpt-4o-transcribe ---
@@ -277,6 +289,46 @@ Rules:
 
   const result = JSON.parse(response.getContentText());
   return result.content[0].text;
+}
+
+// --- Summarization (only for long notes) ---
+
+function summarize(processed, config) {
+  const systemPrompt = `You summarize voice note transcripts.
+
+Rules:
+- Output a single concise sentence capturing the gist of the note (under 25 words).
+- Output ONLY the sentence text — no bullet prefix, no quotes, no meta-commentary.
+- Do not editorialize or add information that is not in the note.
+- Preserve [[double bracket tags]] from the original that are central to the gist.`;
+
+  const payload = {
+    model: "claude-sonnet-4-6",
+    max_tokens: 300,
+    system: systemPrompt,
+    messages: [
+      { role: "user", content: processed },
+    ],
+  };
+
+  const response = UrlFetchApp.fetch("https://api.anthropic.com/v1/messages", {
+    method: "post",
+    headers: {
+      "x-api-key": config.anthropicKey,
+      "anthropic-version": "2023-06-01",
+      "Content-Type": "application/json",
+    },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true,
+  });
+
+  const code = response.getResponseCode();
+  if (code !== 200) {
+    throw new Error("Anthropic summary API failed (" + code + "): " + response.getContentText());
+  }
+
+  const result = JSON.parse(response.getContentText());
+  return result.content[0].text.trim();
 }
 
 // --- Step 3: Send to Matrix ---
