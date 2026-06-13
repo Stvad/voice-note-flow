@@ -248,7 +248,8 @@ function postProcess(transcription, config) {
   const systemPrompt = `You are a transcription post-processor. You clean up voice note transcriptions and format them as hierarchical bulleted lists.
 
 Rules:
-- Remove filler words and duplications
+- Preserve EVERY sentence the speaker said. Including: opening remarks ("okay, let's see..."), test scaffolding ("checking if this works"), asides, throwaway comments, self-corrections. "Filler" means filler WORDS (uh, um, like, you know, sort of) and verbal repetitions of the same phrase — NOT entire sentences. If you're unsure whether something is content or filler, KEEP IT. Never drop a sentence because it seems unimportant, meta, or like the speaker was just warming up.
+- Remove filler words and duplications (per the above scope)
 - Convert formatting words like "comma" into actual formatting
 - Format output as a hierarchical bulleted list (Roam Research style)
 - Limit to 5 levels of nesting
