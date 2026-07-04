@@ -266,7 +266,6 @@ Rules:
 - Hierarchical entries (slashes, e.g. "wcs/whip", "to/buy", "Roam/garden") may be matched either from the full form ("to buy", "wcs whip") OR from the base/last segment ("whip", "buy") WHEN context makes the domain unambiguous — e.g. "whip" → [[wcs/whip]] inside a passage about swing dancing; "to buy" → [[to/buy]] when expressing a buying intent. If context is ambiguous (e.g. "whip" in a cooking discussion), leave it as plain text.
 - Only bracket the FIRST occurrence of each matched term in the note; subsequent mentions of the same term stay as plain text (use whatever the speaker actually said).
 - Tag any dates mentioned with Roam date format: [[Month DDth, YYYY]] (e.g. [[February 27th, 2026]], [[March 1st, 2026]]). This rule applies regardless of the Known terms list, and applies to every date mention (not just the first).
-- If there are multiple topics and some include action items, TODOs, or commitments, add a final top-level bullet "- **Action items:**" with each action as a nested bullet. But if the entire note is essentially one short action item, do NOT add a separate Action items section — that would just duplicate the content.
 
 Known terms (the user's canonical names/projects/topics). Two purposes: (1) if a transcript word is phonetically close to one of these and the context fits, correct it; (2) use them as the source of truth for [[double bracket]] auto-linking per the rules above:
 ${keytermsList}`;
