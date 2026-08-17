@@ -1,8 +1,14 @@
 // ============================================================
 // Voice Note Processor — Google Apps Script
 // Watches Google Drive folders for new audio files,
-// transcribes with gpt-4o-transcribe, post-processes with
+// transcribes with Deepgram Nova-3, post-processes with
 // Claude Sonnet, and sends the result to Matrix.
+//
+// Which files are "done" is decided by a ledger of file IDs
+// (SEEN_FILES), never by a high-water timestamp. The timestamp
+// window only bounds how much of Drive we ask about, so a note
+// that finishes syncing out of order is still picked up.
+// See planRun_ / pruneState_ for the rules.
 // ============================================================
 
 // --- Config helpers ---
@@ -10,6 +16,10 @@
 function getConfig() {
   const props = PropertiesService.getScriptProperties();
   const splitList = (s) => (s || "").split(",").map(x => x.trim()).filter(Boolean);
+  const num = (key, fallback) => {
+    const parsed = Number(props.getProperty(key));
+    return isFinite(parsed) && parsed > 0 ? parsed : fallback;
+  };
   return {
     deepgramKey: props.getProperty("DEEPGRAM_API_KEY"),
     anthropicKey: props.getProperty("ANTHROPIC_API_KEY"),
@@ -24,8 +34,26 @@ function getConfig() {
     // boost. Optional — if empty, falls back to first 95 of KEYTERMS.
     // Deepgram Nova-3 caps at 100 keyterms per request.
     acousticKeyterms: splitList(props.getProperty("ACOUSTIC_KEYTERMS")),
+    // How far back the Drive query looks. A note that finishes syncing within
+    // this window of its own modified time is still processed, regardless of
+    // what synced before it. Raise it before a long offline stretch.
+    lookbackMs: num("LOOKBACK_DAYS", 7) * 24 * 60 * 60 * 1000,
+    // On a virgin install, process only this many of the most recent files
+    // rather than the whole back catalogue.
+    initialLimit: num("INITIAL_LIMIT", 1),
+    // Give up on a file after this many failed runs (then post a Matrix notice).
+    maxAttempts: num("MAX_ATTEMPTS", 3),
+    // Ledger capacity. Must comfortably exceed the number of notes you record
+    // per lookback window — see pruneState_ for what happens if it doesn't.
+    maxSeenEntries: num("MAX_SEEN_ENTRIES", 120),
+    // Stop starting new files after this long, so we commit cleanly instead of
+    // being killed mid-file by the Apps Script execution limit.
+    runBudgetMs: num("RUN_BUDGET_SECONDS", 270) * 1000,
   };
 }
+
+// Script Properties cap each value at 9KB; stay clear of the edge.
+const PROPERTY_VALUE_LIMIT = 8500;
 
 // --- Trigger setup (run once) ---
 
@@ -60,39 +88,223 @@ function checkNewVoiceNotes() {
   }
 }
 
-function checkNewVoiceNotesLocked_() {
-  // INITIAL_LIMIT: configurable via Script Properties, default 1
-  // On first run (no cutoff stored), only process this many most recent files.
-  // On subsequent runs, process all files newer than the cutoff.
-  const config = getConfig();
-  const props = PropertiesService.getScriptProperties();
-  const cutoff = Number(props.getProperty("LAST_PROCESSED_TIME") || "0");
-  const initialLimit = Number(props.getProperty("INITIAL_LIMIT") || "1");
-  const recentIds = JSON.parse(props.getProperty("RECENT_FILE_IDS") || "[]");
-  const recentSet = new Set(recentIds);
+// ============================================================
+// Selection logic — pure functions, unit-tested in
+// scripts/test_selection.js. No Apps Script services in here.
+// ============================================================
 
-  const audioMimeTypes = [
-    "audio/mpeg", "audio/mp4", "audio/m4a", "audio/ogg",
-    "audio/wav", "audio/x-wav", "audio/webm", "audio/aac",
-    "audio/amr", "audio/3gpp", "video/mp4",
-  ];
+const AUDIO_MIME_TYPES = [
+  "audio/mpeg", "audio/mp4", "audio/m4a", "audio/ogg",
+  "audio/wav", "audio/x-wav", "audio/webm", "audio/aac",
+  "audio/amr", "audio/3gpp", "video/mp4",
+];
+const AUDIO_EXTENSIONS = [
+  ".mp3", ".m4a", ".ogg", ".wav", ".webm", ".aac", ".amr", ".3gp", ".mp4",
+];
 
-  Logger.log("Cutoff: " + cutoff + " (" + (cutoff ? new Date(cutoff).toISOString() : "none") + ")");
-  Logger.log("Folder IDs: " + JSON.stringify(config.folderIds));
-  Logger.log("Recent IDs tracked: " + recentIds.length);
+function isAudioFile_(name, mimeType) {
+  if (AUDIO_MIME_TYPES.indexOf(mimeType) !== -1) return true;
+  const lower = String(name || "").toLowerCase();
+  const dot = lower.lastIndexOf(".");
+  if (dot === -1) return false;
+  return AUDIO_EXTENSIONS.indexOf(lower.substring(dot)) !== -1;
+}
 
-  // Collect new audio files across all folders using Drive search API
-  const newFiles = [];
-  const audioExtensions = [".mp3", ".m4a", ".ogg", ".wav", ".webm", ".aac", ".amr", ".3gp", ".mp4"];
+// The Drive query's lower bound. The floor is a hard limit the ledger imposes
+// (see pruneState_); the rolling lookback takes over once it overtakes the
+// floor, which is what lets a late-syncing note back into view.
+function computeWindowStart_(floorMs, nowMs, lookbackMs) {
+  return Math.max(floorMs || 0, nowMs - lookbackMs);
+}
 
-  // Build date filter for Drive query (createdDate not supported by DriveApp, use modifiedDate)
-  const cutoffDate = cutoff > 0
-    ? " and modifiedDate > '" + new Date(cutoff).toISOString() + "'"
-    : "";
+function byModifiedAsc_(a, b) {
+  return (a.modifiedMs - b.modifiedMs) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+}
+
+// Decide what to process this run.
+//
+// candidates: [{id, name, mimeType, modifiedMs, size}] from the Drive query
+// state:      {floor, seen: {id: modifiedMs}, attempts: {id: count}}
+// returns:    {windowStart, toProcess (oldest-first), floor, bootstrap, skipped}
+//
+// Oldest-first matters: the run may be cut short by the execution limit, and
+// each file is committed to the ledger as it completes. Going oldest-first
+// means an interrupted run leaves the *newest* files pending, and those are
+// still inside the window next time. Newest-first would strand the older ones.
+function planRun_(candidates, state, nowMs, opts) {
+  const floor = state.floor || 0;
+  const seen = state.seen || {};
+  const attempts = state.attempts || {};
+  const windowStart = computeWindowStart_(floor, nowMs, opts.lookbackMs);
+  const skipped = { outsideWindow: 0, notAudio: 0, seen: 0, exhausted: 0, empty: 0 };
+
+  const eligible = [];
+  for (const file of candidates) {
+    if (file.modifiedMs <= windowStart) { skipped.outsideWindow++; continue; }
+    if (!isAudioFile_(file.name, file.mimeType)) { skipped.notAudio++; continue; }
+    if (seen[file.id] !== undefined) { skipped.seen++; continue; }
+    if ((attempts[file.id] || 0) >= opts.maxAttempts) { skipped.exhausted++; continue; }
+    // A zero-byte file is still uploading. Leave it out of the ledger entirely
+    // so the next run reconsiders it.
+    if (file.size === 0) { skipped.empty++; continue; }
+    eligible.push(file);
+  }
+
+  // floor === 0 means we have never run. Take only the newest few and raise the
+  // floor past everything else, so a fresh install does not replay the archive.
+  if (floor === 0) {
+    if (eligible.length === 0) {
+      return { windowStart: windowStart, toProcess: [], floor: 0, bootstrap: false, skipped: skipped };
+    }
+    const newestFirst = eligible.slice().sort((a, b) => byModifiedAsc_(b, a));
+    const keep = newestFirst.slice(0, Math.max(1, opts.initialLimit));
+    const dropped = newestFirst.slice(keep.length);
+    const oldestKept = keep[keep.length - 1].modifiedMs;
+    const newFloor = dropped.length > 0
+      ? Math.min(dropped[0].modifiedMs, oldestKept - 1)
+      : oldestKept - 1;
+    return {
+      windowStart: windowStart,
+      toProcess: keep.sort(byModifiedAsc_),
+      floor: newFloor,
+      bootstrap: true,
+      skipped: skipped,
+    };
+  }
+
+  return {
+    windowStart: windowStart,
+    toProcess: eligible.sort(byModifiedAsc_),
+    floor: floor,
+    bootstrap: false,
+    skipped: skipped,
+  };
+}
+
+// Keep the ledger bounded without ever letting a processed file become
+// eligible again.
+//
+// Entries below the window can be forgotten for free — the query will not
+// return those files anyway. If the ledger is *still* over capacity after
+// that, we forget the oldest entries and raise the floor to match, which
+// pulls the window up so the forgotten files stay out of scope. That is the
+// invariant the whole design rests on: the window never reaches further back
+// than the ledger can remember.
+function pruneState_(state, windowStart, maxSeenEntries, liveIds) {
+  let floor = state.floor || 0;
+  const seen = {};
+  for (const id in state.seen) {
+    if (state.seen[id] > windowStart) seen[id] = state.seen[id];
+  }
+
+  const entries = Object.keys(seen).map(id => ({ id: id, modifiedMs: seen[id] }));
+  if (entries.length > maxSeenEntries) {
+    entries.sort(byModifiedAsc_);
+    const dropped = entries.slice(0, entries.length - maxSeenEntries);
+    for (const entry of dropped) delete seen[entry.id];
+    floor = Math.max(floor, dropped[dropped.length - 1].modifiedMs);
+  }
+
+  // Attempt counters are only meaningful for files still in view and not yet
+  // done; everything else expires.
+  const attempts = {};
+  for (const id in state.attempts) {
+    if (liveIds && !liveIds.has(id)) continue;
+    if (seen[id] !== undefined) continue;
+    attempts[id] = state.attempts[id];
+  }
+
+  return { floor: floor, seen: seen, attempts: attempts };
+}
+
+// ============================================================
+// State persistence
+// ============================================================
+
+function loadState_(props, nowMs) {
+  const rawSeen = props.getProperty("SEEN_FILES");
+  if (rawSeen !== null) {
+    return {
+      floor: Number(props.getProperty("PROCESS_FLOOR_TIME") || "0"),
+      seen: JSON.parse(rawSeen),
+      attempts: JSON.parse(props.getProperty("FAILED_ATTEMPTS") || "{}"),
+    };
+  }
+
+  // Migrate from the old LAST_PROCESSED_TIME high-water mark. The old cutoff
+  // becomes the floor, so nothing already handled gets replayed; the rolling
+  // lookback takes over from there. Migrated IDs are stamped with *now* rather
+  // than their real modified time so they survive a full lookback window —
+  // the timestamp in the ledger only decides when an entry may be forgotten.
+  const legacyFloor = Number(props.getProperty("LAST_PROCESSED_TIME") || "0");
+  const legacyIds = JSON.parse(props.getProperty("RECENT_FILE_IDS") || "[]");
+  const seen = {};
+  for (const id of legacyIds) seen[id] = nowMs;
+
+  // Persist both halves now, not at the end of the run. commitSeen_ writes
+  // SEEN_FILES as files complete, so if this run dies early we would otherwise
+  // come back with a ledger but no floor — which planRun_ reads as a virgin
+  // install and would silently skip everything pending.
+  props.setProperty("PROCESS_FLOOR_TIME", String(legacyFloor));
+  props.setProperty("SEEN_FILES", JSON.stringify(seen));
+  Logger.log("Migrated legacy state: floor=" + new Date(legacyFloor).toISOString() +
+    ", " + legacyIds.length + " known file IDs");
+  return { floor: legacyFloor, seen: seen, attempts: {} };
+}
+
+// Commit a single file's outcome immediately. Doing this per file (rather than
+// once at the end) is what makes an interrupted run safe.
+function commitSeen_(props, state, file) {
+  state.seen[file.id] = file.modifiedMs;
+  delete state.attempts[file.id];
+  props.setProperty("SEEN_FILES", JSON.stringify(state.seen));
+  props.setProperty("FAILED_ATTEMPTS", JSON.stringify(state.attempts));
+}
+
+function commitAttempt_(props, state, file) {
+  const count = (state.attempts[file.id] || 0) + 1;
+  state.attempts[file.id] = count;
+  props.setProperty("FAILED_ATTEMPTS", JSON.stringify(state.attempts));
+  return count;
+}
+
+function saveState_(props, state, windowStart, liveIds, config) {
+  let cap = config.maxSeenEntries;
+  let pruned = pruneState_(state, windowStart, cap, liveIds);
+  // Defensive: if the ledger somehow still does not fit in a Script Property,
+  // shrink until it does. pruneState_ raises the floor accordingly.
+  while (JSON.stringify(pruned.seen).length > PROPERTY_VALUE_LIMIT && cap > 1) {
+    cap = Math.floor(cap / 2);
+    pruned = pruneState_(state, windowStart, cap, liveIds);
+    Logger.log("WARNING: ledger too large for a Script Property; capped at " + cap +
+      " entries and raised the floor. Lower LOOKBACK_DAYS or expect less " +
+      "tolerance for late-syncing notes.");
+  }
+
+  props.setProperty("PROCESS_FLOOR_TIME", String(pruned.floor));
+  props.setProperty("SEEN_FILES", JSON.stringify(pruned.seen));
+  props.setProperty("FAILED_ATTEMPTS", JSON.stringify(pruned.attempts));
+  state.floor = pruned.floor;
+  state.seen = pruned.seen;
+  state.attempts = pruned.attempts;
+}
+
+// ============================================================
+// Main loop
+// ============================================================
+
+// Read every file in the window across all watched folders, as plain objects
+// (plus the DriveApp handle) so the selection logic stays pure.
+function collectCandidates_(config, windowStart) {
+  const candidates = [];
+  const since = new Date(windowStart).toISOString();
 
   for (const folderId of config.folderIds) {
-    const query = "'" + folderId + "' in parents and trashed = false" + cutoffDate;
-    Logger.log("Searching: " + query);
+    // createdDate is not supported by DriveApp's query language, so this
+    // filters on modifiedDate. That is exactly why the ledger — not this
+    // timestamp — decides what has been processed.
+    const query = "'" + folderId + "' in parents and trashed = false" +
+      " and modifiedDate > '" + since + "'";
 
     let files;
     try {
@@ -103,62 +315,92 @@ function checkNewVoiceNotesLocked_() {
     }
 
     let scanned = 0;
-    let matched = 0;
-
     while (files.hasNext()) {
       const file = files.next();
       scanned++;
-      if (recentSet.has(file.getId())) continue;
-      const mime = file.getMimeType();
-      const name = file.getName().toLowerCase();
-      const ext = name.substring(name.lastIndexOf("."));
-      if (!audioMimeTypes.includes(mime) && !audioExtensions.includes(ext)) continue;
-      matched++;
-      newFiles.push(file);
+      candidates.push({
+        id: file.getId(),
+        name: file.getName(),
+        mimeType: file.getMimeType(),
+        modifiedMs: file.getLastUpdated().getTime(),
+        size: file.getSize(),
+        file: file,
+      });
     }
-
-    Logger.log("  " + scanned + " files from Drive, " + matched + " new audio matches");
+    Logger.log("  folder " + folderId + ": " + scanned + " files in window");
   }
 
-  // Sort newest first by modification time (consistent with query filter)
-  newFiles.sort((a, b) => b.getLastUpdated().getTime() - a.getLastUpdated().getTime());
+  return candidates;
+}
 
-  // If no cutoff yet (first run), limit to initialLimit most recent
-  const filesToProcess = cutoff === 0 ? newFiles.slice(0, initialLimit) : newFiles;
+function checkNewVoiceNotesLocked_() {
+  const config = getConfig();
+  const props = PropertiesService.getScriptProperties();
+  const runStart = Date.now();
+  const state = loadState_(props, runStart);
 
-  for (const file of filesToProcess) {
-    Logger.log("Processing: " + file.getName() + " (" + file.getMimeType() + ")");
+  const windowStart = computeWindowStart_(state.floor, runStart, config.lookbackMs);
+  Logger.log("Window start: " + new Date(windowStart).toISOString() +
+    " (floor " + (state.floor ? new Date(state.floor).toISOString() : "none") +
+    ", lookback " + (config.lookbackMs / 86400000) + "d)");
+  Logger.log("Ledger: " + Object.keys(state.seen).length + " known, " +
+    Object.keys(state.attempts).length + " with failed attempts");
+
+  const candidates = collectCandidates_(config, windowStart);
+  const plan = planRun_(candidates, state, runStart, config);
+  if (plan.bootstrap) {
+    state.floor = plan.floor;
+    props.setProperty("PROCESS_FLOOR_TIME", String(plan.floor));
+    Logger.log("First run: processing " + plan.toProcess.length + " most recent file(s); " +
+      "floor set to " + new Date(plan.floor).toISOString());
+  }
+  Logger.log("Plan: " + plan.toProcess.length + " to process, skipped " +
+    JSON.stringify(plan.skipped));
+
+  let done = 0;
+  for (const item of plan.toProcess) {
+    if (Date.now() - runStart > config.runBudgetMs) {
+      Logger.log("Run budget reached; deferring " + (plan.toProcess.length - done) +
+        " file(s) to the next run.");
+      break;
+    }
+    done++;
+    Logger.log("Processing: " + item.name + " (" + item.mimeType + ")");
 
     try {
-      const result = processVoiceNote(file, config);
+      const result = processVoiceNote(item.file, config);
       sendMatrixMessage(result, config);
-      Logger.log("Sent to Matrix: " + file.getName() + "\n" + result);
+      commitSeen_(props, state, item);
+      Logger.log("Sent to Matrix: " + item.name + "\n" + result);
     } catch (e) {
-      Logger.log("Error processing " + file.getName() + ": " + e.message);
+      const attempt = commitAttempt_(props, state, item);
+      Logger.log("Error processing " + item.name + " (attempt " + attempt + "/" +
+        config.maxAttempts + "): " + e.message);
+      if (attempt >= config.maxAttempts) {
+        // Out of retries. Record it as handled so it stops blocking the queue,
+        // but say so out loud rather than dropping it silently.
+        commitSeen_(props, state, item);
+        notifyGiveUp_(item, e, config);
+      }
     }
-
-    // Update cutoff using modifiedDate (consistent with Drive query)
-    const fileTime = file.getLastUpdated().getTime();
-    if (fileTime > cutoff) {
-      props.setProperty("LAST_PROCESSED_TIME", String(fileTime));
-    }
-
-    // Track file ID to prevent reprocessing on re-upload
-    recentSet.add(file.getId());
   }
 
-  // If first run and we limited, set cutoff to the newest file across all results
-  if (cutoff === 0 && newFiles.length > 0) {
-    const newestTime = newFiles[0].getLastUpdated().getTime();
-    props.setProperty("LAST_PROCESSED_TIME", String(newestTime));
-  }
+  const liveIds = new Set(candidates.map(c => c.id));
+  saveState_(props, state, windowStart, liveIds, config);
+}
 
-  // Save recent IDs (keep last 50 to avoid unbounded growth)
-  if (filesToProcess.length > 0) {
-    const allIds = [...recentSet];
-    const trimmed = allIds.slice(Math.max(0, allIds.length - 50));
-    props.setProperty("RECENT_FILE_IDS", JSON.stringify(trimmed));
-    Logger.log("Processed " + filesToProcess.length + " files this run.");
+function notifyGiveUp_(item, err, config) {
+  try {
+    // getUrl() is a Drive call and can itself fail, so it stays inside the try.
+    sendMatrixMessage(
+      "- [[voice note failed]] " + item.name +
+      "\n  - Gave up after " + config.maxAttempts + " attempts" +
+      "\n  - error:: " + err.message +
+      "\n  - audio-url::" + item.file.getUrl(),
+      config
+    );
+  } catch (e) {
+    Logger.log("Could not send failure notice for " + item.name + ": " + e.message);
   }
 }
 
@@ -393,6 +635,74 @@ function testWithLatestFile() {
   // sendMatrixMessage(result, config);
 }
 
+// --- Backfill: recover notes stranded below the floor ---
+//
+// Notes missed by the old high-water-mark scheme sit below the current floor,
+// so the normal loop will never see them. This lists them without touching
+// anything; nothing is sent to Matrix.
+//
+// Run backfillDryRun() from the editor, or set BACKFILL_DAYS to change the
+// range (default 14).
+
+function backfillDryRun(daysBack) {
+  const config = getConfig();
+  const props = PropertiesService.getScriptProperties();
+  const days = daysBack || Number(props.getProperty("BACKFILL_DAYS") || "14");
+  const now = Date.now();
+  const state = loadState_(props, now);
+  const since = now - days * 24 * 60 * 60 * 1000;
+
+  const candidates = collectCandidates_(config, since)
+    .filter(c => isAudioFile_(c.name, c.mimeType) && state.seen[c.id] === undefined)
+    .sort(byModifiedAsc_);
+
+  Logger.log("Unprocessed audio in the last " + days + " days: " + candidates.length);
+  for (const c of candidates) {
+    Logger.log("  " + new Date(c.modifiedMs).toISOString() + "  " + c.name + "  " + c.id);
+  }
+  Logger.log("\nTo process these: set BACKFILL_FILE_IDS to a comma-separated list " +
+    "of the IDs above, then run backfillProcess().");
+  return candidates.map(c => c.id);
+}
+
+// Process an explicit list of file IDs and add them to the ledger. Reads
+// BACKFILL_FILE_IDS unless passed a list directly.
+function backfillProcess(fileIds) {
+  const config = getConfig();
+  const props = PropertiesService.getScriptProperties();
+  const ids = fileIds || (props.getProperty("BACKFILL_FILE_IDS") || "")
+    .split(",").map(s => s.trim()).filter(Boolean);
+  if (ids.length === 0) {
+    Logger.log("Nothing to do: pass file IDs or set BACKFILL_FILE_IDS.");
+    return;
+  }
+
+  const state = loadState_(props, Date.now());
+  for (const id of ids) {
+    let file;
+    try {
+      file = DriveApp.getFileById(id);
+    } catch (e) {
+      Logger.log("Skipping " + id + ": " + e.message);
+      continue;
+    }
+    if (state.seen[id] !== undefined) {
+      Logger.log("Skipping " + file.getName() + ": already in the ledger.");
+      continue;
+    }
+    const item = { id: id, name: file.getName(), modifiedMs: file.getLastUpdated().getTime(), file: file };
+    Logger.log("Backfilling: " + item.name);
+    try {
+      const result = processVoiceNote(file, config);
+      sendMatrixMessage(result, config);
+      commitSeen_(props, state, item);
+      Logger.log("Sent to Matrix: " + item.name);
+    } catch (e) {
+      Logger.log("Error backfilling " + item.name + ": " + e.message);
+    }
+  }
+}
+
 // --- Reset processed files (use to start fresh) ---
 
 function resetProcessedFiles() {
@@ -400,6 +710,21 @@ function resetProcessedFiles() {
   props.deleteProperty("PROCESSED_FILE_IDS");
   props.deleteProperty("LAST_PROCESSED_TIME");
   props.deleteProperty("RECENT_FILE_IDS");
+  props.deleteProperty("PROCESS_FLOOR_TIME");
+  props.deleteProperty("SEEN_FILES");
+  props.deleteProperty("FAILED_ATTEMPTS");
   Logger.log("Cleared processed file history. Next run will process only the " +
     (props.getProperty("INITIAL_LIMIT") || "1") + " most recent file(s), then track from there.");
+}
+
+// --- Node interop (for scripts/test_selection.js) ---
+// `module` is undefined under Apps Script, so this is a no-op there.
+
+if (typeof module !== "undefined") {
+  module.exports = {
+    computeWindowStart_: computeWindowStart_,
+    isAudioFile_: isAudioFile_,
+    planRun_: planRun_,
+    pruneState_: pruneState_,
+  };
 }

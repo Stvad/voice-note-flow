@@ -1,0 +1,6 @@
+# .clasp.json sets skipSubdirectories:false, so without this every .js under
+# scripts/ would be pushed into the Apps Script project — including the node
+# test file, which uses require() and would break the deploy.
+**/**
+!appsscript.json
+!Code.js
