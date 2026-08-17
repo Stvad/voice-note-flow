@@ -16,6 +16,15 @@
 function getConfig() {
   const props = PropertiesService.getScriptProperties();
   const splitList = (s) => (s || "").split(",").map(x => x.trim()).filter(Boolean);
+  const dedupe = (list) => {
+    const seen = {};
+    return list.filter(t => {
+      const key = t.toLowerCase();
+      if (seen[key]) return false;
+      seen[key] = true;
+      return true;
+    });
+  };
   const num = (key, fallback) => {
     const parsed = Number(props.getProperty(key));
     return isFinite(parsed) && parsed > 0 ? parsed : fallback;
@@ -28,12 +37,23 @@ function getConfig() {
     // Comma-separated folder IDs to watch
     folderIds: splitList(props.getProperty("FOLDER_IDS")),
     // KEYTERMS: canonical names/projects/topics used for Claude auto-linking
-    // (can be large — only items in this list get [[bracketed]])
-    keyterms: splitList(props.getProperty("KEYTERMS")),
+    // (can be large — only items in this list get [[bracketed]]).
+    // MANUAL_KEYTERMS: hand-added terms, kept in a separate property so
+    // regenerating KEYTERMS from a Roam dump never clobbers them. They go
+    // first: the post-processing prompt breaks ambiguous matches by list
+    // order, and a term you added by hand is the higher-signal one.
+    keyterms: dedupe(
+      splitList(props.getProperty("MANUAL_KEYTERMS"))
+        .concat(splitList(props.getProperty("KEYTERMS")))
+    ),
     // ACOUSTIC_KEYTERMS: focused subset sent to Deepgram for transcription
     // boost. Optional — if empty, falls back to first 95 of KEYTERMS.
-    // Deepgram Nova-3 caps at 100 keyterms per request.
-    acousticKeyterms: splitList(props.getProperty("ACOUSTIC_KEYTERMS")),
+    // Deepgram Nova-3 caps at 100 keyterms per request. Manual terms lead
+    // here too, since they survive the URL-length cap that way.
+    acousticKeyterms: dedupe(
+      splitList(props.getProperty("MANUAL_KEYTERMS"))
+        .concat(splitList(props.getProperty("ACOUSTIC_KEYTERMS")))
+    ),
     // How far back the Drive query looks. A note that finishes syncing within
     // this window of its own modified time is still processed, regardless of
     // what synced before it. Raise it before a long offline stretch.
@@ -505,6 +525,7 @@ Rules:
 - NEVER respond with meta-commentary about the transcription (e.g. "the transcript seems cut off", "could you provide more"). Always process whatever text you receive, no matter how short, fragmented, or incomplete. Your only job is to clean up and format what's there.
 - Auto-link with [[double brackets]] ONLY for terms from the "Known terms" list below. Do not bracket any other names, projects, or topics — leave them as plain text.
 - Fuzzy match: a partial or mistranscribed mention should still link to the canonical list entry. E.g. if the speaker says "Bobby" and the list contains "Bobby Smith", output [[Bobby Smith]]. If multiple list entries could plausibly match, pick the first one in list order.
+- Links are ALWAYS plain [[Canonical Term]] with nothing after the term. NEVER write alias/pipe syntax like [[Bobby Smith|Bobby]] or [[Bobby Smith|he]] — that is Obsidian syntax, and it renders as broken text here. When the speaker uses a shorthand, replace it outright with the canonical form: "Bobby" becomes [[Bobby Smith]], not [[Bobby Smith|Bobby]].
 - Hierarchical entries (slashes, e.g. "wcs/whip", "to/buy", "Roam/garden") may be matched either from the full form ("to buy", "wcs whip") OR from the base/last segment ("whip", "buy") WHEN context makes the domain unambiguous — e.g. "whip" → [[wcs/whip]] inside a passage about swing dancing; "to buy" → [[to/buy]] when expressing a buying intent. If context is ambiguous (e.g. "whip" in a cooking discussion), leave it as plain text.
 - Only bracket the FIRST occurrence of each matched term in the note; subsequent mentions of the same term stay as plain text (use whatever the speaker actually said).
 - Tag any dates mentioned with Roam date format: [[Month DDth, YYYY]] (e.g. [[February 27th, 2026]], [[March 1st, 2026]]). This rule applies regardless of the Known terms list, and applies to every date mention (not just the first).
@@ -633,6 +654,30 @@ function testWithLatestFile() {
   Logger.log("Result:\n" + result);
   // Uncomment to also send to Matrix:
   // sendMatrixMessage(result, config);
+}
+
+// --- Keyterm inspection ---
+//
+// Prints the effective lists and how close each stored property is to the
+// Script Property 9KB per-value cap (oversized writes are silently dropped).
+// Run this before regenerating KEYTERMS so hand-added terms can be moved into
+// MANUAL_KEYTERMS first, where a regeneration will not touch them.
+
+function dumpKeyterms() {
+  const props = PropertiesService.getScriptProperties();
+  const config = getConfig();
+  const raw = (key) => props.getProperty(key) || "";
+
+  for (const key of ["KEYTERMS", "MANUAL_KEYTERMS", "ACOUSTIC_KEYTERMS"]) {
+    const value = raw(key);
+    const count = value ? value.split(",").filter(s => s.trim()).length : 0;
+    Logger.log(key + ": " + count + " terms, " + value.length + " bytes" +
+      (value.length > 8500 ? "  <-- NEAR THE 9KB CAP" : ""));
+  }
+  Logger.log("\nEffective link list (" + config.keyterms.length + " terms):\n" +
+    config.keyterms.join(","));
+  Logger.log("\nEffective acoustic list (" + config.acousticKeyterms.length + " terms):\n" +
+    config.acousticKeyterms.join(","));
 }
 
 // --- Backfill: recover notes stranded below the floor ---
