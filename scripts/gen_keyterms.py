@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Generate KEYTERMS (Claude linking, comprehensive) and ACOUSTIC_KEYTERMS
-(Deepgram boost, focused) from a Roam alias CSV dump.
+(Deepgram boost, focused) from a knowledge-graph alias CSV dump.
 
-The CSV is expected to have columns: alias, block_id, usage_count,
-distinct_sources, via_property_field, block_total_refs, num_aliases_on_block,
-block_types, content_preview.
+Only three columns are read: alias, block_id, usage_count. Any others
+(distinct_sources, block_types, content_preview, …) are ignored, so the
+source of the dump does not matter much.
+
+Current source is Knowledge Medium via scripts/keyterms_query.sql — see that
+file for the query and, importantly, for which reference kinds have to be
+excluded to get vocabulary rather than SRS plumbing. (Historically this was a
+Roam alias export; same three columns.)
 
 Heuristic:
   LINK list  : dedupe by block_id, drop pure noise (single-char/symbol
@@ -153,7 +158,12 @@ HARD_ACOUSTIC_BLOCKLIST = {
 # Distinctive single-word or short-phrase proper nouns to always include in
 # the acoustic list (regardless of usage), since the transcriber reliably
 # mangles them.
-DISTINCTIVE_SINGLES_OR_PHRASES = {
+#
+# A list, not a set: the acoustic budget is tight enough that order decides
+# what survives, and set iteration order varies per process (str hashing is
+# randomised), which made the generated list irreproducible run to run.
+# Most-mangled first.
+DISTINCTIVE_SINGLES_OR_PHRASES = [
     "habryka", "johnswentworth", "Aella", "Raemon", "wildbow",
     "Murphyjitsu", "Beeminder", "Modafinil", "Aeropress", "RescueTime",
     "Karabiner", "Promnesia", "CrowdAnki", "Mexifold", "Penultima",
@@ -166,7 +176,7 @@ DISTINCTIVE_SINGLES_OR_PHRASES = {
     "asteriskmag.com", "SwingLiteracy.com", "Genesis House",
     "Mission City Swing", "Westie Pirates SF", "Jack & Jill O'Rama",
     "Programmable attention", "zettelkasten", "TAP",
-}
+]
 
 
 def is_likely_personal_name(s: str) -> bool:
@@ -206,17 +216,26 @@ def build_lists(entries, threshold: int, max_link_bytes: int, pinned=()):
     organic = [u for (a, u) in candidates if a not in pinned_set]
     effective_threshold = organic[-1] if organic else None
 
-    acoustic, seen = [], set()
+    seen = set()
     # Pass 1: high-usage personal names that aren't common English phrases
+    names = []
     for alias, usage in entries:
         if usage < 18: break
         if alias in seen or alias in HARD_ACOUSTIC_BLOCKLIST: continue
         if is_likely_personal_name(alias) and len(alias) < 40:
-            acoustic.append(alias); seen.add(alias)
+            names.append(alias); seen.add(alias)
     # Pass 2: distinctive proper-noun jargon (regardless of usage)
-    for alias in DISTINCTIVE_SINGLES_OR_PHRASES:
-        if alias not in seen:
-            acoustic.append(alias); seen.add(alias)
+    distinctive = [a for a in DISTINCTIVE_SINGLES_OR_PHRASES if a not in seen]
+
+    # Interleave rather than concatenate. Both caps below (95 terms, and the
+    # 2KB Deepgram URL) bite well before either list is exhausted, so
+    # appending one after the other silently starves the second — the curated
+    # jargon is precisely what the transcriber mangles, so losing all of it to
+    # a long tail of names is the wrong trade.
+    acoustic = []
+    for i in range(max(len(names), len(distinctive))):
+        if i < len(names): acoustic.append(names[i])
+        if i < len(distinctive): acoustic.append(distinctive[i])
     # Cap by both Deepgram's 100-keyterm limit AND Apps Script's 2KB URL cap.
     # Each acoustic term contributes len("&keyterm=") + urlencoded length to
     # the Deepgram request URL (base ~64 chars). 1900 leaves a safety margin.

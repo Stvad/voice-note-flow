@@ -1,0 +1,49 @@
+# Terms always dropped from the generated keyterm lists.
+# Passed via: gen_keyterms.py <csv> --exclude scripts/keyterms_exclude.txt
+# One term per line and/or comma-separated; '#' starts a comment.
+#
+# These survive the dictionary-based generic filter for two reasons: they are
+# capitalised/acronyms, or they are modern words absent from /usr/share/dict/words
+# (web2 dates to 1934, so it has "track" but not "tracking", and no "app"/"llm").
+
+# --- automation and system plumbing ---
+@openwhisperer:matrix.org
+@stvad:matrix.org
+matrix-messages
+matrix-rx
+Matrix Highlight
+otter.ai
+otter.ai/transcript
+ccc-yt-timestamp
+automation
+automation log
+archived_today
+memo/archived
+queries/daily-non-srs
+queries/daily-srs
+Claude daily summary
+Voice notes inbox process
+Quick Capture inbox
+tocheck
+
+# --- SRS / task-state machinery ---
+DONE
+TODO
+ptr
+srm
+sr
+c1
+pomodoro_estimate
+
+# --- years: the prompt already tags dates via the Roam date rule ---
+2021, 2022, 2023, 2024, 2025, 2026
+
+# --- generic modern vocabulary the 1934 dictionary does not contain ---
+app
+llm
+inbox
+mentions
+goals
+tracking
+names
+offline

@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 
 from gen_keyterms import (
+    DISTINCTIVE_SINGLES_OR_PHRASES,
     build_lists,
     is_generic,
     load_terms_file,
@@ -117,6 +118,33 @@ class TestBuildListsPinning(unittest.TestCase):
         _, _, eff = build_lists(entries, threshold=12, max_link_bytes=8800,
                                 pinned=["Rare Name"])
         self.assertEqual(eff, 50, "a pinned outlier must not report as the cutoff")
+
+
+class TestAcousticList(unittest.TestCase):
+    def test_curated_jargon_is_not_starved_by_a_long_tail_of_names(self):
+        # 60 name-shaped entries is more than the acoustic caps allow, so
+        # appending the curated list after them would drop all of it.
+        entries = [(f"Personname Surname{i}", 100) for i in range(60)]
+        _, acoustic, _ = build_lists(entries, threshold=12, max_link_bytes=8800)
+
+        self.assertEqual(acoustic[0], "Personname Surname0")
+        self.assertEqual(acoustic[1], DISTINCTIVE_SINGLES_OR_PHRASES[0],
+                         "curated jargon must interleave, not trail")
+        for term in DISTINCTIVE_SINGLES_OR_PHRASES[:5]:
+            self.assertIn(term, acoustic)
+
+    def test_curated_list_order_is_deterministic(self):
+        # It was a set literal, whose iteration order varies with per-process
+        # str hash randomisation — the generated list differed run to run.
+        self.assertIsInstance(DISTINCTIVE_SINGLES_OR_PHRASES, list)
+
+    def test_acoustic_fits_the_deepgram_url_budget(self):
+        entries = [(f"Personname Surname{i}", 100) for i in range(200)]
+        _, acoustic, _ = build_lists(entries, threshold=12, max_link_bytes=8800)
+
+        self.assertLessEqual(len(acoustic), 95, "Deepgram caps at 100 keyterms")
+        url_cost = sum(len("&keyterm=") + len(t) for t in acoustic)
+        self.assertLessEqual(url_cost, 1900, "Apps Script caps URLs at 2KB")
 
 
 if __name__ == "__main__":
