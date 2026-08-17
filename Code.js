@@ -29,6 +29,12 @@ function getConfig() {
     const parsed = Number(props.getProperty(key));
     return isFinite(parsed) && parsed > 0 ? parsed : fallback;
   };
+  // Shorthands the fuzzy matcher would otherwise resolve to the wrong person.
+  const disambiguations = parseDisambiguations_(props.getProperty("KEYTERM_ALIASES"));
+  const manual = splitList(props.getProperty("MANUAL_KEYTERMS"));
+  // A disambiguation target has to be a Known term, or the "only bracket
+  // terms from the list" rule forbids the very link we are asking for.
+  const canonicals = disambiguations.map(d => d.canonical);
   return {
     deepgramKey: props.getProperty("DEEPGRAM_API_KEY"),
     anthropicKey: props.getProperty("ANTHROPIC_API_KEY"),
@@ -43,16 +49,22 @@ function getConfig() {
     // first: the post-processing prompt breaks ambiguous matches by list
     // order, and a term you added by hand is the higher-signal one.
     keyterms: dedupe(
-      splitList(props.getProperty("MANUAL_KEYTERMS"))
+      canonicals
+        .concat(manual)
         .concat(splitList(props.getProperty("KEYTERMS")))
     ),
+    // KEYTERM_ALIASES: "shorthand => Canonical Term" pairs, comma-separated.
+    // Ordering the list is not enough on its own — "Vlad" is an exact
+    // first-token match for "Vlad Sterzhanov" but not a token of
+    // "Vladyslav Sitalo" at all, so the matcher genuinely prefers the wrong
+    // one. These are stated as rules instead.
+    disambiguations: disambiguations,
     // ACOUSTIC_KEYTERMS: focused subset sent to Deepgram for transcription
     // boost. Optional — if empty, falls back to first 95 of KEYTERMS.
     // Deepgram Nova-3 caps at 100 keyterms per request. Manual terms lead
     // here too, since they survive the URL-length cap that way.
     acousticKeyterms: dedupe(
-      splitList(props.getProperty("MANUAL_KEYTERMS"))
-        .concat(splitList(props.getProperty("ACOUSTIC_KEYTERMS")))
+      manual.concat(splitList(props.getProperty("ACOUSTIC_KEYTERMS")))
     ),
     // How far back the Drive query looks. A note that finishes syncing within
     // this window of its own modified time is still processed, regardless of
@@ -121,6 +133,35 @@ const AUDIO_MIME_TYPES = [
 const AUDIO_EXTENSIONS = [
   ".mp3", ".m4a", ".ogg", ".wav", ".webm", ".aac", ".amr", ".3gp", ".mp4",
 ];
+
+// Parse KEYTERM_ALIASES: "Vlad => Vladyslav Sitalo, Ash => Ashley Qian".
+// Malformed entries are skipped rather than throwing — a typo in a Script
+// Property should not take the whole pipeline down.
+function parseDisambiguations_(raw) {
+  const out = [];
+  const seen = {};
+  for (const entry of String(raw || "").split(",")) {
+    const idx = entry.indexOf("=>");
+    if (idx === -1) continue;
+    const shorthand = entry.slice(0, idx).trim();
+    const canonical = entry.slice(idx + 2).trim();
+    if (!shorthand || !canonical) continue;
+    const key = shorthand.toLowerCase();
+    if (seen[key]) continue; // first mapping wins
+    seen[key] = true;
+    out.push({ shorthand: shorthand, canonical: canonical });
+  }
+  return out;
+}
+
+function renderDisambiguations_(disambiguations) {
+  if (!disambiguations || disambiguations.length === 0) return "";
+  return "\n\nPreferred resolutions. When the speaker says one of these " +
+    "shorthands, always link it to the canonical term paired with it here — " +
+    "even if a different Known term looks like a closer or more frequent " +
+    "match. These override the fuzzy-match and list-order rules above:\n" +
+    disambiguations.map(d => `- "${d.shorthand}" -> [[${d.canonical}]]`).join("\n");
+}
 
 function isAudioFile_(name, mimeType) {
   if (AUDIO_MIME_TYPES.indexOf(mimeType) !== -1) return true;
@@ -531,7 +572,7 @@ Rules:
 - Tag any dates mentioned with Roam date format: [[Month DDth, YYYY]] (e.g. [[February 27th, 2026]], [[March 1st, 2026]]). This rule applies regardless of the Known terms list, and applies to every date mention (not just the first).
 
 Known terms (the user's canonical names/projects/topics). Two purposes: (1) if a transcript word is phonetically close to one of these and the context fits, correct it; (2) use them as the source of truth for [[double bracket]] auto-linking per the rules above:
-${keytermsList}`;
+${keytermsList}${renderDisambiguations_(config.disambiguations)}`;
 
   const payload = {
     model: "claude-sonnet-4-6",
@@ -771,5 +812,7 @@ if (typeof module !== "undefined") {
     isAudioFile_: isAudioFile_,
     planRun_: planRun_,
     pruneState_: pruneState_,
+    parseDisambiguations_: parseDisambiguations_,
+    renderDisambiguations_: renderDisambiguations_,
   };
 }

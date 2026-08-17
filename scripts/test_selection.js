@@ -12,6 +12,8 @@ const {
   isAudioFile_,
   planRun_,
   pruneState_,
+  parseDisambiguations_,
+  renderDisambiguations_,
 } = require("../Code.js");
 
 const HOUR = 3600 * 1000;
@@ -221,6 +223,48 @@ test("after migrating off the high-water mark, late syncs are caught", () => {
 
   assert.deepStrictEqual(ids(plan), ["synced-late"]);
   assert.strictEqual(plan.floor, migrated.floor, "the floor never advances on its own");
+});
+
+// --- KEYTERM_ALIASES ---
+
+test("disambiguations parse from the shorthand => canonical form", () => {
+  assert.deepStrictEqual(
+    parseDisambiguations_("Vlad => Vladyslav Sitalo, Ash =>Ashley Qian"),
+    [
+      { shorthand: "Vlad", canonical: "Vladyslav Sitalo" },
+      { shorthand: "Ash", canonical: "Ashley Qian" },
+    ]
+  );
+});
+
+test("malformed entries are skipped, not fatal", () => {
+  // A typo in a Script Property must not take the pipeline down.
+  assert.deepStrictEqual(
+    parseDisambiguations_("no arrow here, Vlad => Vladyslav Sitalo, => , X =>"),
+    [{ shorthand: "Vlad", canonical: "Vladyslav Sitalo" }]
+  );
+});
+
+test("empty or absent config yields no rules and no prompt section", () => {
+  assert.deepStrictEqual(parseDisambiguations_(null), []);
+  assert.deepStrictEqual(parseDisambiguations_(""), []);
+  assert.strictEqual(renderDisambiguations_([]), "");
+});
+
+test("the first mapping for a shorthand wins", () => {
+  assert.deepStrictEqual(
+    parseDisambiguations_("Vlad => Vladyslav Sitalo, vlad => Vlad Sterzhanov"),
+    [{ shorthand: "Vlad", canonical: "Vladyslav Sitalo" }]
+  );
+});
+
+test("rendered section states the override and names both sides", () => {
+  const rendered = renderDisambiguations_(
+    parseDisambiguations_("Vlad => Vladyslav Sitalo")
+  );
+
+  assert.match(rendered, /"Vlad" -> \[\[Vladyslav Sitalo\]\]/);
+  assert.match(rendered, /override/i, "must outrank the fuzzy-match rule");
 });
 
 // --- pruneState_ ---
