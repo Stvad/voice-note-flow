@@ -1,8 +1,12 @@
 -- Extract alias usage from the Knowledge Medium graph, as input to
 -- gen_keyterms.py. Bind ?1 to the workspace id.
 --
---   npx @knowledge-medium/agent-cli sql all "$(cat scripts/keyterms_query.sql)" \
+--   npx @knowledge-medium/agent-cli sql all \
+--     "$(sed '/^--/d;/^$/d' scripts/keyterms_query.sql)" \
 --     '["<workspace-id>"]' -p <profile> > aliases.json
+--
+-- The sed is required, not cosmetic: the CLI's argument parser reads a leading
+-- "--" comment line as an unknown option and refuses to run.
 --
 -- Then convert to CSV (alias, block_id, usage_count are the columns
 -- gen_keyterms.py actually reads) and run the generator.

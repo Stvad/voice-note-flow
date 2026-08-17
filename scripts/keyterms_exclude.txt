@@ -47,3 +47,9 @@ goals
 tracking
 names
 offline
+
+# --- capitalised topic pages: generic despite the capital, so the
+#     case-sensitive dictionary filter cannot catch them ---
+Housing
+Coaching
+Transportation
