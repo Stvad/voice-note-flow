@@ -499,7 +499,20 @@ function processVoiceNote(file, config) {
 // --- Step 1: Transcribe with Deepgram Nova-3 ---
 
 function transcribeAudio(file, config) {
+  // Drive hands back a partially-synced file without complaint, and Deepgram
+  // transcribes exactly the bytes it was given — a note caught mid-upload comes
+  // back quietly missing its tail. Bracket the read with the file's size so that
+  // shows up in the log instead of looking like a clean short transcript.
+  // The "after" size goes through a fresh File handle on purpose: DriveApp
+  // caches metadata per object, so re-asking `file` would just echo the value
+  // collectCandidates_ already read.
+  const sizeAtScan = file.getSize();
   const blob = file.getBlob();
+  const bytes = blob.getBytes();
+  const sizeNow = DriveApp.getFileById(file.getId()).getSize();
+  Logger.log("Audio read: sent " + bytes.length + " bytes (Drive size " +
+    sizeAtScan + " at scan, " + sizeNow + " after read)" +
+    (bytes.length === sizeNow ? "" : "  <-- SHORT READ, file was still uploading"));
 
   // Apps Script UrlFetchApp caps URLs at 2KB. Build the URL incrementally and
   // stop appending keyterms once we get close to the limit.
@@ -526,7 +539,7 @@ function transcribeAudio(file, config) {
       "Authorization": "Token " + config.deepgramKey,
     },
     contentType: blob.getContentType(),
-    payload: blob.getBytes(),
+    payload: bytes,
     muteHttpExceptions: true,
   });
 
