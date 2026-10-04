@@ -4,6 +4,10 @@
 // transcribes with Deepgram Nova-3, post-processes with
 // Claude Sonnet, and sends the result to Matrix.
 //
+// Two kinds of folder: voice notes (FOLDER_IDS), and audio the
+// phone extracts from every video it records (VIDEO_FOLDER_IDS,
+// fed by android/extract_video_audio.py). See SOURCES.
+//
 // Which files are "done" is decided by a ledger of file IDs
 // (SEEN_FILES), never by a high-water timestamp. The timestamp
 // window only bounds how much of Drive we ask about, so a note
@@ -35,13 +39,17 @@ function getConfig() {
   // A disambiguation target has to be a Known term, or the "only bracket
   // terms from the list" rule forbids the very link we are asking for.
   const canonicals = disambiguations.map(d => d.canonical);
+  const videoFolderIds = splitList(props.getProperty("VIDEO_FOLDER_IDS"));
   return {
     deepgramKey: props.getProperty("DEEPGRAM_API_KEY"),
     anthropicKey: props.getProperty("ANTHROPIC_API_KEY"),
     matrixAccessToken: props.getProperty("MATRIX_ACCESS_TOKEN"),
     matrixRoomId: props.getProperty("MATRIX_ROOM_ID"),
-    // Comma-separated folder IDs to watch
-    folderIds: splitList(props.getProperty("FOLDER_IDS")),
+    // Comma-separated folder IDs to watch. A folder listed in both is treated
+    // as a video folder, so its files are not picked up twice.
+    folderIds: splitList(props.getProperty("FOLDER_IDS"))
+      .filter(id => videoFolderIds.indexOf(id) === -1),
+    videoFolderIds: videoFolderIds,
     // KEYTERMS: canonical names/projects/topics used for Claude auto-linking
     // (can be large — only items in this list get [[bracketed]]).
     // MANUAL_KEYTERMS: hand-added terms, kept in a separate property so
@@ -133,6 +141,22 @@ const AUDIO_MIME_TYPES = [
 const AUDIO_EXTENSIONS = [
   ".mp3", ".m4a", ".ogg", ".wav", ".webm", ".aac", ".amr", ".3gp", ".mp4",
 ];
+
+// What differs between the kinds of folder we watch. Video audio comes from
+// every clip the camera records, most of them with nobody talking, so silence
+// there is normal rather than worth a message.
+const SOURCES = {
+  voice: { footer: "", reportNoSpeech: true },
+  video: { footer: "\n- source:: [[video note]]", reportNoSpeech: false },
+};
+
+// meta: {url, name, timestamp, source}
+function renderFooter_(meta) {
+  return "\n- audio-url::" + meta.url +
+    "\n- audio-file-name::" + meta.name +
+    "\n- timestamp::" + meta.timestamp +
+    SOURCES[meta.source].footer;
+}
 
 // Parse KEYTERM_ALIASES: "Vlad => Vladyslav Sitalo, Ash => Ashley Qian".
 // Malformed entries are skipped rather than throwing — a typo in a Script
@@ -375,8 +399,10 @@ function saveState_(props, state, windowStart, liveIds, config) {
 function collectCandidates_(config, windowStart) {
   const candidates = [];
   const since = new Date(windowStart).toISOString();
+  const folders = config.folderIds.map(id => ({ id: id, source: "voice" }))
+    .concat(config.videoFolderIds.map(id => ({ id: id, source: "video" })));
 
-  for (const folderId of config.folderIds) {
+  for (const { id: folderId, source } of folders) {
     // createdDate is not supported by DriveApp's query language, so this
     // filters on modifiedDate. That is exactly why the ledger — not this
     // timestamp — decides what has been processed.
@@ -401,10 +427,11 @@ function collectCandidates_(config, windowStart) {
         mimeType: file.getMimeType(),
         modifiedMs: file.getLastUpdated().getTime(),
         size: file.getSize(),
+        source: source,
         file: file,
       });
     }
-    Logger.log("  folder " + folderId + ": " + scanned + " files in window");
+    Logger.log("  " + source + " folder " + folderId + ": " + scanned + " files in window");
   }
 
   return candidates;
@@ -458,10 +485,14 @@ function checkNewVoiceNotesLocked_() {
       attempt + "/" + config.maxAttempts);
 
     try {
-      const result = processVoiceNote(item.file, config);
-      sendMatrixMessage(result, config);
+      const result = processVoiceNote(item.file, config, item.source);
+      if (result === null) {
+        Logger.log("No speech in " + item.name + "; nothing sent.");
+      } else {
+        sendMatrixMessage(result, config);
+        Logger.log("Sent to Matrix: " + item.name + "\n" + result);
+      }
       commitSeen_(props, state, item);
-      Logger.log("Sent to Matrix: " + item.name + "\n" + result);
     } catch (e) {
       Logger.log("Error processing " + item.name + " (attempt " + attempt + "/" +
         config.maxAttempts + "): " + e.message);
@@ -497,19 +528,22 @@ function notifyGiveUp_(item, err, config) {
 
 const SUMMARY_THRESHOLD_CHARS = 1000;
 
-function processVoiceNote(file, config) {
-  const fileName = file.getName();
-  const webViewLink = file.getUrl();
+// Returns the Matrix message, or null when there is nothing worth sending.
+// source is "voice" or "video" (see SOURCES); it defaults to "voice".
+function processVoiceNote(file, config, source) {
+  source = source || "voice";
   const created = file.getDateCreated();
   const tz = PropertiesService.getScriptProperties().getProperty("TIMEZONE") || "UTC";
-  const timestamp = Utilities.formatDate(created, tz, "dd/MM/yyyy HH:mm:ss z");
-  const footer = "\n- audio-url::" + webViewLink +
-    "\n- audio-file-name::" + fileName +
-    "\n- timestamp::" + timestamp;
+  const footer = renderFooter_({
+    url: file.getUrl(),
+    name: file.getName(),
+    timestamp: Utilities.formatDate(created, tz, "dd/MM/yyyy HH:mm:ss z"),
+    source: source,
+  });
 
   const transcription = transcribeAudio(file, config);
   if (!transcription || transcription.trim() === "") {
-    return "- [[no speech detected]]" + footer;
+    return SOURCES[source].reportNoSpeech ? "- [[no speech detected]]" + footer : null;
   }
   const processed = postProcess(transcription, config);
 
@@ -820,16 +854,26 @@ function backfillProcess(fileIds) {
       continue;
     }
     const item = { id: id, name: file.getName(), modifiedMs: file.getLastUpdated().getTime(), file: file };
-    Logger.log("Backfilling: " + item.name);
+    const source = sourceOfFile_(file, config);
+    Logger.log("Backfilling: " + item.name + " (" + source + ")");
     try {
-      const result = processVoiceNote(file, config);
-      sendMatrixMessage(result, config);
+      const result = processVoiceNote(file, config, source);
+      if (result !== null) sendMatrixMessage(result, config);
       commitSeen_(props, state, item);
-      Logger.log("Sent to Matrix: " + item.name);
+      Logger.log((result === null ? "No speech, nothing sent: " : "Sent to Matrix: ") + item.name);
     } catch (e) {
       Logger.log("Error backfilling " + item.name + ": " + e.message);
     }
   }
+}
+
+// The normal loop knows which folder a file came from; a bare file ID does not.
+function sourceOfFile_(file, config) {
+  const parents = file.getParents();
+  while (parents.hasNext()) {
+    if (config.videoFolderIds.indexOf(parents.next().getId()) !== -1) return "video";
+  }
+  return "voice";
 }
 
 // --- Reset processed files (use to start fresh) ---
@@ -857,5 +901,7 @@ if (typeof module !== "undefined") {
     pruneState_: pruneState_,
     parseDisambiguations_: parseDisambiguations_,
     renderDisambiguations_: renderDisambiguations_,
+    renderFooter_: renderFooter_,
+    SOURCES: SOURCES,
   };
 }

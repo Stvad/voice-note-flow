@@ -14,6 +14,8 @@ const {
   pruneState_,
   parseDisambiguations_,
   renderDisambiguations_,
+  renderFooter_,
+  SOURCES,
 } = require("../Code.js");
 
 const HOUR = 3600 * 1000;
@@ -340,4 +342,34 @@ test("attempt counters are cleared once the file succeeds", () => {
   const pruned = pruneState_(s, NOW - 7 * DAY, 150, new Set(["done"]));
 
   assert.deepStrictEqual(pruned.attempts, {});
+});
+
+// --- Sources ---
+
+const META = {
+  url: "https://drive.google.com/file/d/abc/view",
+  name: "20261004_143012.m4a",
+  timestamp: "04/10/2026 14:45:00 CEST",
+};
+
+test("voice note footer is unchanged by the source split", () => {
+  assert.strictEqual(
+    renderFooter_(Object.assign({ source: "voice" }, META)),
+    "\n- audio-url::https://drive.google.com/file/d/abc/view" +
+    "\n- audio-file-name::20261004_143012.m4a" +
+    "\n- timestamp::04/10/2026 14:45:00 CEST"
+  );
+});
+
+test("video note footer says where the audio came from", () => {
+  const footer = renderFooter_(Object.assign({ source: "video" }, META));
+
+  assert.match(footer, /\n- source:: \[\[video note\]\]$/);
+  assert.ok(footer.startsWith(renderFooter_(Object.assign({ source: "voice" }, META))));
+});
+
+test("silent video clips are not reported, silent voice notes are", () => {
+  // Every clip the camera records lands here, most without anyone talking.
+  assert.strictEqual(SOURCES.video.reportNoSpeech, false);
+  assert.strictEqual(SOURCES.voice.reportNoSpeech, true);
 });
