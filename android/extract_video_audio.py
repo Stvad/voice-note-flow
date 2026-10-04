@@ -15,6 +15,7 @@ the floor only marks where the ledger starts, so the first run does not
 replay the whole camera roll.
 """
 import argparse
+import contextlib
 import fcntl
 import json
 import logging
@@ -192,18 +193,39 @@ def save_state(path: Path, state: State) -> None:
     os.replace(tmp, path)
 
 
+def termux(*cmd: str) -> bool:
+    """Run a Termux helper command, when there is one (i.e. on the phone).
+    Best effort: these go through Termux's own services, which can hang, and
+    none of them is worth failing a run over."""
+    if not shutil.which(cmd[0]):
+        return False
+    try:
+        return subprocess.run(cmd, capture_output=True, timeout=30).returncode == 0
+    except (OSError, subprocess.SubprocessError) as e:
+        log.warning("%s failed: %s", cmd[0], e)
+        return False
+
+
 def notify(title: str, content: str, notification_id: str | None = None) -> None:
-    """Best effort phone notification (Termux:API). Nothing else would tell you.
+    """Phone notification via Termux:API. Nothing else would tell you.
     Reusing an id replaces the earlier notification instead of stacking."""
-    if not shutil.which("termux-notification"):
-        return
     cmd = ["termux-notification", "--title", title, "--content", content]
     if notification_id:
         cmd += ["--id", notification_id]
+    termux(*cmd)
+
+
+@contextlib.contextmanager
+def wake_lock():
+    """Keep the CPU awake while ffmpeg works. termux-job-scheduler hands the
+    script to Termux and returns at once, so the job's own wakelock is gone
+    before we start, and with the screen off the phone would doze mid-file."""
+    held = termux("termux-wake-lock")
     try:
-        subprocess.run(cmd, capture_output=True, timeout=30)
-    except (OSError, subprocess.SubprocessError) as e:
-        log.warning("could not post a notification: %s", e)
+        yield
+    finally:
+        if held:
+            termux("termux-wake-unlock")
 
 
 FILE_ERRORS = (ProbeError, subprocess.CalledProcessError, subprocess.TimeoutExpired)
@@ -252,27 +274,28 @@ def run(cfg: Config, now: float) -> None:
     for video in plan.exhausted:
         give_up(video, "a run was cut off while processing it")
 
-    for video in plan.to_process:
-        attempt = state.attempts.get(video.name, 0) + 1
-        state.attempts[video.name] = attempt
-        save_state(state_path, state)
-        started = time.monotonic()
-        try:
-            out = process_one(video, cfg)
-        except FILE_ERRORS as e:
-            log.warning("%s failed (attempt %d/%d): %s",
-                        video.name, attempt, cfg.max_attempts, describe(e))
-            if attempt >= cfg.max_attempts:
-                give_up(video, describe(e))
-            continue
-        state.done[video.name] = video.mtime
-        state.attempts.pop(video.name, None)
-        save_state(state_path, state)
-        if out is None:
-            log.info("%s has no audio track; skipped", video.name)
-        else:
-            log.info("%s -> %s (%.0f MB video, %.1fs)", video.name, out,
-                     video.size / 1e6, time.monotonic() - started)
+    with wake_lock() if plan.to_process else contextlib.nullcontext():
+        for video in plan.to_process:
+            attempt = state.attempts.get(video.name, 0) + 1
+            state.attempts[video.name] = attempt
+            save_state(state_path, state)
+            started = time.monotonic()
+            try:
+                out = process_one(video, cfg)
+            except FILE_ERRORS as e:
+                log.warning("%s failed (attempt %d/%d): %s",
+                            video.name, attempt, cfg.max_attempts, describe(e))
+                if attempt >= cfg.max_attempts:
+                    give_up(video, describe(e))
+                continue
+            state.done[video.name] = video.mtime
+            state.attempts.pop(video.name, None)
+            save_state(state_path, state)
+            if out is None:
+                log.info("%s has no audio track; skipped", video.name)
+            else:
+                log.info("%s -> %s (%.0f MB video, %.1fs)", video.name, out,
+                         video.size / 1e6, time.monotonic() - started)
 
     save_state(state_path, prune_state(state, {v.name for v in videos}))
 
