@@ -589,7 +589,9 @@ ${keytermsList}${renderDisambiguations_(config.disambiguations)}`;
 
   const payload = {
     model: "claude-sonnet-4-6",
-    max_tokens: 4096,
+    // The cleaned-up note is about as long as the transcript, so this is what
+    // caps the length of a note: 16K tokens is roughly an hour of speech.
+    max_tokens: 16384,
     system: systemPrompt,
     messages: [
       { role: "user", content: transcription },
