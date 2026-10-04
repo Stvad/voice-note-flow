@@ -186,7 +186,11 @@ function byModifiedAsc_(a, b) {
 //
 // candidates: [{id, name, mimeType, modifiedMs, size}] from the Drive query
 // state:      {floor, seen: {id: modifiedMs}, attempts: {id: count}}
-// returns:    {windowStart, toProcess (oldest-first), floor, bootstrap, skipped}
+// returns:    {windowStart, toProcess (oldest-first), exhausted, floor, bootstrap, skipped}
+//
+// exhausted lists the files that ran out of attempts without ever being
+// committed. The caller owes each one a give-up notice: when the last attempt
+// was killed by the execution limit, nothing else will announce it.
 //
 // Oldest-first matters: the run may be cut short by the execution limit, and
 // each file is committed to the ledger as it completes. Going oldest-first
@@ -200,11 +204,16 @@ function planRun_(candidates, state, nowMs, opts) {
   const skipped = { outsideWindow: 0, notAudio: 0, seen: 0, exhausted: 0, empty: 0 };
 
   const eligible = [];
+  const exhausted = [];
   for (const file of candidates) {
     if (file.modifiedMs <= windowStart) { skipped.outsideWindow++; continue; }
     if (!isAudioFile_(file.name, file.mimeType)) { skipped.notAudio++; continue; }
     if (seen[file.id] !== undefined) { skipped.seen++; continue; }
-    if ((attempts[file.id] || 0) >= opts.maxAttempts) { skipped.exhausted++; continue; }
+    if ((attempts[file.id] || 0) >= opts.maxAttempts) {
+      skipped.exhausted++;
+      exhausted.push(file);
+      continue;
+    }
     // A zero-byte file is still uploading. Leave it out of the ledger entirely
     // so the next run reconsiders it.
     if (file.size === 0) { skipped.empty++; continue; }
@@ -215,7 +224,10 @@ function planRun_(candidates, state, nowMs, opts) {
   // floor past everything else, so a fresh install does not replay the archive.
   if (floor === 0) {
     if (eligible.length === 0) {
-      return { windowStart: windowStart, toProcess: [], floor: 0, bootstrap: false, skipped: skipped };
+      return {
+        windowStart: windowStart, toProcess: [], exhausted: exhausted,
+        floor: 0, bootstrap: false, skipped: skipped,
+      };
     }
     const newestFirst = eligible.slice().sort((a, b) => byModifiedAsc_(b, a));
     const keep = newestFirst.slice(0, Math.max(1, opts.initialLimit));
@@ -227,6 +239,7 @@ function planRun_(candidates, state, nowMs, opts) {
     return {
       windowStart: windowStart,
       toProcess: keep.sort(byModifiedAsc_),
+      exhausted: exhausted,
       floor: newFloor,
       bootstrap: true,
       skipped: skipped,
@@ -236,6 +249,7 @@ function planRun_(candidates, state, nowMs, opts) {
   return {
     windowStart: windowStart,
     toProcess: eligible.sort(byModifiedAsc_),
+    exhausted: exhausted,
     floor: floor,
     bootstrap: false,
     skipped: skipped,
@@ -322,6 +336,8 @@ function commitSeen_(props, state, file) {
   props.setProperty("FAILED_ATTEMPTS", JSON.stringify(state.attempts));
 }
 
+// Called as an attempt starts. FAILED_ATTEMPTS keeps its old name for state
+// compatibility, but it counts attempts that have not (yet) succeeded.
 function commitAttempt_(props, state, file) {
   const count = (state.attempts[file.id] || 0) + 1;
   state.attempts[file.id] = count;
@@ -418,6 +434,15 @@ function checkNewVoiceNotesLocked_() {
   Logger.log("Plan: " + plan.toProcess.length + " to process, skipped " +
     JSON.stringify(plan.skipped));
 
+  // Files whose last attempt never came back: the run was killed mid-file,
+  // almost certainly by the 6-minute execution limit. Retrying would only kill
+  // the next run too, and every note queued behind this one with it.
+  for (const item of plan.exhausted) {
+    commitSeen_(props, state, item);
+    notifyGiveUp_(item, new Error("run was cut off before it finished " +
+      "(Apps Script's 6-minute execution limit?)"), config);
+  }
+
   let done = 0;
   for (const item of plan.toProcess) {
     if (Date.now() - runStart > config.runBudgetMs) {
@@ -426,7 +451,11 @@ function checkNewVoiceNotesLocked_() {
       break;
     }
     done++;
-    Logger.log("Processing: " + item.name + " (" + item.mimeType + ")");
+    // Counted before the work, not on failure: a run killed mid-file never
+    // reaches the catch below, and would otherwise retry the same file forever.
+    const attempt = commitAttempt_(props, state, item);
+    Logger.log("Processing: " + item.name + " (" + item.mimeType + "), attempt " +
+      attempt + "/" + config.maxAttempts);
 
     try {
       const result = processVoiceNote(item.file, config);
@@ -434,7 +463,6 @@ function checkNewVoiceNotesLocked_() {
       commitSeen_(props, state, item);
       Logger.log("Sent to Matrix: " + item.name + "\n" + result);
     } catch (e) {
-      const attempt = commitAttempt_(props, state, item);
       Logger.log("Error processing " + item.name + " (attempt " + attempt + "/" +
         config.maxAttempts + "): " + e.message);
       if (attempt >= config.maxAttempts) {

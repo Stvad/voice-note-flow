@@ -167,6 +167,19 @@ test("a file that keeps failing is dropped after maxAttempts", () => {
   assert.strictEqual(plan.skipped.exhausted, 1);
 });
 
+test("an exhausted file is handed back for a give-up notice, not dropped silently", () => {
+  // Attempts are counted before the work starts, so a run killed by the 6-minute
+  // limit still uses one up. Such a file never reaches the catch block that
+  // would announce it, so the plan has to surface it instead.
+  const stuck = cand("stuck", 2);
+  const s = state({ attempts: { stuck: 3 } });
+
+  const plan = planRun_([stuck], s, NOW, OPTS);
+
+  assert.deepStrictEqual(ids(plan), []);
+  assert.deepStrictEqual(plan.exhausted.map(f => f.id), ["stuck"]);
+});
+
 test("a file below maxAttempts is retried", () => {
   const s = state({ attempts: { flaky: 2 } });
 
