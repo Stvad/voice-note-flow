@@ -7,12 +7,14 @@ android/SETUP.md). Each new video in the camera folder becomes a small mono
 VIDEO_FOLDER_IDS, and Code.js takes it from there.
 
 Audio rather than video is the point: Apps Script can't send more than 50MB in
-one request, and a phone video passes that within a minute or so. Mono 64 kbps
-AAC is about 0.5 MB a minute, which leaves room for roughly 100 minutes.
+one request, and a phone video passes that within a minute or so. 16 kHz mono
+AAC at 32 kbps is about 0.24 MB a minute, so roughly 80 minutes fit under
+Autosync's 20 MB free-tier upload cap. 16 kHz is what speech recognition works
+at anyway, so nothing Deepgram uses is lost.
 
 What counts as new mirrors Code.js. A ledger of handled file names decides;
 the floor only marks where the ledger starts, so the first run does not
-replay the whole camera roll.
+replay the whole camera roll (unless --since says how far back to go).
 """
 import argparse
 import contextlib
@@ -25,7 +27,8 @@ import shutil
 import subprocess
 import sys
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime
 from pathlib import Path
 
 SHARED = Path("/storage/emulated/0")
@@ -67,6 +70,8 @@ class Config:
     settle_seconds: float
     initial_limit: int
     max_attempts: int
+    since: float | None = None  # lower the floor to here (backfill)
+    upload_limit_mb: float = 20.0  # Autosync free tier won't upload past this
 
 
 # ============================================================
@@ -114,6 +119,20 @@ def plan_run(videos, state, now, *, settle_seconds, max_attempts, initial_limit)
                 state.floor, deferred)
 
 
+def apply_since(state: State, since: float | None) -> State:
+    """Move the floor back to `since`, to backfill videos from before the first
+    run. The ledger keeps already-handled videos from going round again. Never
+    raises the floor: that would silently skip videos still waiting."""
+    if since is None or (state.floor is not None and state.floor <= since):
+        return state
+    return replace(state, floor=since)
+
+
+def parse_since(text: str) -> float:
+    """"2026-10-03" or "2026-10-03T18:30", in the phone's local time."""
+    return datetime.fromisoformat(text).timestamp()
+
+
 def prune_state(state: State, present: set) -> State:
     """Forget videos that are no longer on the phone. Their names are the only
     thing that could ever bring them back, and the floor already keeps
@@ -158,11 +177,11 @@ def audio_stream_count(path: Path) -> int:
 
 
 def extract_audio(src: Path, dst: Path) -> None:
-    # Deepgram gains nothing from stereo or a higher bitrate.
+    # See the module docstring for why 16 kHz mono at 32 kbps.
     subprocess.run(
         ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-         "-i", str(src), "-map", "0:a:0", "-ac", "1", "-c:a", "aac", "-b:a", "64k",
-         "-movflags", "+faststart", str(dst)],
+         "-i", str(src), "-map", "0:a:0", "-ac", "1", "-ar", "16000",
+         "-c:a", "aac", "-b:a", "32k", "-movflags", "+faststart", str(dst)],
         check=True, capture_output=True, text=True, timeout=1800,
     )
 
@@ -175,9 +194,19 @@ def process_one(video: Video, cfg: Config) -> str | None:
     out_name = Path(video.name).stem + ".m4a"
     tmp = cfg.staging / out_name
     extract_audio(src, tmp)
+    # Autosync carries the mtime over to Drive, and Code.js dates the note by
+    # it, so a backfilled clip lands on the day it was recorded.
+    os.utime(tmp, (video.mtime, video.mtime))
     # Autosync must never see a half-written file, so it only appears in the
     # outbox once complete.
     os.replace(tmp, cfg.outbox / out_name)
+
+    size_mb = (cfg.outbox / out_name).stat().st_size / 1e6
+    if size_mb > cfg.upload_limit_mb:
+        # Still worth keeping: it can be uploaded by hand.
+        log.warning("%s is %.1f MB, over the %.0f MB upload limit; Autosync will "
+                    "skip it", out_name, size_mb, cfg.upload_limit_mb)
+        notify("Video audio: too big to upload", f"{out_name} is {size_mb:.0f} MB")
     return out_name
 
 
@@ -253,6 +282,11 @@ def run(cfg: Config, now: float) -> None:
 
     state_path = cfg.state_dir / "state.json"
     state = load_state(state_path)
+    backfilled = apply_since(state, cfg.since)
+    if backfilled is not state:
+        log.info("floor moved back to %s; videos since then that were not yet "
+                 "handled will be processed", datetime.fromtimestamp(backfilled.floor))
+        state = backfilled
     videos = scan(cfg.camera_dir)
     plan = plan_run(videos, state, now, settle_seconds=cfg.settle_seconds,
                     max_attempts=cfg.max_attempts, initial_limit=cfg.initial_limit)
@@ -317,11 +351,17 @@ def parse_args(argv) -> tuple[Config, bool]:
     p.add_argument("--initial-limit", type=int, default=0,
                    help="on the first run, also process this many of the newest videos")
     p.add_argument("--max-attempts", type=int, default=3)
+    p.add_argument("--since", type=parse_since, metavar="DATE",
+                   help="also process videos recorded since DATE (2026-10-03 or "
+                        "2026-10-03T18:30, local time). Only moves the start back.")
+    p.add_argument("--upload-limit-mb", type=float, default=20.0,
+                   help="warn when an extracted file is bigger than Autosync uploads")
     p.add_argument("--dry-run", action="store_true",
                    help="print what would be processed and change nothing")
     a = p.parse_args(argv)
     cfg = Config(a.camera_dir, a.outbox, a.staging, a.state_dir,
-                 a.settle_seconds, a.initial_limit, a.max_attempts)
+                 a.settle_seconds, a.initial_limit, a.max_attempts,
+                 a.since, a.upload_limit_mb)
     return cfg, a.dry_run
 
 
@@ -338,11 +378,14 @@ def setup_logging(state_dir: Path) -> None:
 
 
 def dry_run(cfg: Config, now: float) -> None:
-    state = load_state(cfg.state_dir / "state.json")
+    state = apply_since(load_state(cfg.state_dir / "state.json"), cfg.since)
     plan = plan_run(scan(cfg.camera_dir), state, now, settle_seconds=cfg.settle_seconds,
                     max_attempts=cfg.max_attempts, initial_limit=cfg.initial_limit)
     if state.floor is None:
         print("First run: everything in the camera folder now counts as already handled.")
+    else:
+        print(f"Videos recorded after {datetime.fromtimestamp(state.floor):%Y-%m-%d %H:%M} "
+              "are in scope.")
     for label, videos in (("would process", plan.to_process), ("would give up", plan.exhausted)):
         for v in videos:
             print(f"{label}: {v.name}  ({v.size / 1e6:.0f} MB)")

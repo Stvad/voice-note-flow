@@ -13,13 +13,16 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 from extract_video_audio import (
     Config,
     State,
     Video,
+    apply_since,
     is_video_name,
+    parse_since,
     plan_run,
     prune_state,
     run,
@@ -135,6 +138,44 @@ class TestSteadyState(unittest.TestCase):
         self.assertEqual(plan.floor, state.floor)
 
 
+class TestSince(unittest.TestCase):
+    SINCE = NOW - 3 * 24 * 60 * MIN
+
+    def test_first_run_starts_from_the_date_instead_of_now(self):
+        state = apply_since(State(), self.SINCE)
+
+        plan = plan_run([vid("before", 3 * 24 * 60 + 1), vid("after", 3 * 24 * 60 - 1)],
+                        state, NOW, **OPTS)
+
+        self.assertEqual(names(plan.to_process), ["after"])
+
+    def test_lowers_an_existing_floor_without_redoing_handled_videos(self):
+        state = State(floor=NOW - 60 * MIN, done={"handled": NOW - 30 * MIN})
+
+        lowered = apply_since(state, self.SINCE)
+        plan = plan_run([vid("missed", 600), vid("handled", 30)], lowered, NOW, **OPTS)
+
+        self.assertEqual(lowered.floor, self.SINCE)
+        self.assertEqual(names(plan.to_process), ["missed"])
+
+    def test_never_raises_the_floor(self):
+        # Raising it would silently skip videos that are still pending.
+        state = State(floor=self.SINCE - 60 * MIN)
+
+        self.assertEqual(apply_since(state, self.SINCE).floor, state.floor)
+
+    def test_no_date_changes_nothing(self):
+        state = State(floor=NOW)
+
+        self.assertEqual(apply_since(state, None), state)
+        self.assertIsNone(apply_since(State(), None).floor)
+
+    def test_a_bare_date_means_local_midnight(self):
+        self.assertEqual(parse_since("2026-10-03"), datetime(2026, 10, 3).timestamp())
+        self.assertEqual(parse_since("2026-10-03T18:30"),
+                         datetime(2026, 10, 3, 18, 30).timestamp())
+
+
 class TestPrune(unittest.TestCase):
     def test_forgets_videos_that_were_deleted_from_the_phone(self):
         state = State(floor=0.0, done={"kept": 1.0, "deleted": 2.0},
@@ -162,7 +203,7 @@ def make_clip(path, audio=True):
 
 
 @unittest.skipUnless(FFMPEG, "needs ffmpeg and ffprobe on PATH")
-class TestEndToEnd(unittest.TestCase):
+class EndToEndCase(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp)
@@ -176,7 +217,10 @@ class TestEndToEnd(unittest.TestCase):
             max_attempts=3,
         )
         self.cfg.camera_dir.mkdir(parents=True)
-        # First run: start the ledger here, so the clips below count as new.
+        self.first_run()
+
+    def first_run(self):
+        # Start the ledger here, so the clips below count as new.
         run(self.cfg, NOW)
 
     def record(self, name, minutes_after_setup, audio=True):
@@ -192,6 +236,8 @@ class TestEndToEnd(unittest.TestCase):
     def outbox(self):
         return sorted(p.name for p in self.cfg.outbox.iterdir())
 
+
+class TestEndToEnd(EndToEndCase):
     def test_new_video_becomes_mono_m4a_in_the_outbox(self):
         self.record("20261004_143012.mp4", 5)
 
@@ -200,14 +246,34 @@ class TestEndToEnd(unittest.TestCase):
         out = self.cfg.outbox / "20261004_143012.m4a"
         self.assertTrue(out.exists())
         probe = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name,channels",
-             "-of", "json", str(out)],
+            ["ffprobe", "-v", "error", "-show_entries",
+             "stream=codec_type,codec_name,channels,sample_rate", "-of", "json", str(out)],
             capture_output=True, text=True, check=True)
         streams = json.loads(probe.stdout)["streams"]
-        self.assertEqual([(s["codec_type"], s["codec_name"], s["channels"]) for s in streams],
-                         [("audio", "aac", 1)], "audio only, mono")
+        self.assertEqual(
+            [(s["codec_type"], s["codec_name"], s["channels"], s["sample_rate"]) for s in streams],
+            [("audio", "aac", 1, "16000")], "audio only, mono, speech sample rate")
         self.assertEqual(list(self.cfg.staging.glob("*.m4a")), [], "nothing left in staging")
         self.assertIn("20261004_143012.mp4", self.state()["done"])
+
+    def test_audio_keeps_the_videos_recording_time(self):
+        # Autosync carries the mtime over to Drive, where Code.js reads it as the
+        # note's timestamp. Without this a backfilled clip is dated today.
+        self.record("a.mp4", 5)
+
+        run(self.cfg, NOW + 10 * MIN)
+
+        self.assertEqual((self.cfg.outbox / "a.m4a").stat().st_mtime, NOW + 5 * MIN)
+
+    def test_audio_over_the_upload_limit_is_kept_but_flagged(self):
+        self.cfg.upload_limit_mb = 0.001
+        self.record("long.mp4", 5)
+
+        with self.assertLogs("video-audio", level="WARNING") as logs:
+            run(self.cfg, NOW + 10 * MIN)
+
+        self.assertIn("long.m4a", self.outbox())
+        self.assertIn("upload limit", "\n".join(logs.output))
 
     def test_outbox_is_hidden_from_media_apps(self):
         self.assertTrue((self.cfg.outbox / ".nomedia").exists())
@@ -258,6 +324,20 @@ class TestEndToEnd(unittest.TestCase):
         run(self.cfg, NOW + 10 * MIN)
 
         self.assertIn("good.m4a", self.outbox())
+
+
+class TestBackfill(EndToEndCase):
+    def first_run(self):
+        pass  # the test does it, with a start date
+
+    def test_first_run_with_a_date_picks_up_videos_since_then(self):
+        self.record("friday.mp4", -3 * 24 * 60)
+        self.record("saturday.mp4", -2 * 24 * 60)
+        self.cfg.since = NOW - (2 * 24 * 60 + 60) * MIN
+
+        run(self.cfg, NOW)
+
+        self.assertEqual([n for n in self.outbox() if n.endswith(".m4a")], ["saturday.m4a"])
 
 
 if __name__ == "__main__":
