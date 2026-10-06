@@ -373,3 +373,11 @@ test("silent video clips are not reported, silent voice notes are", () => {
   assert.strictEqual(SOURCES.video.reportNoSpeech, false);
   assert.strictEqual(SOURCES.voice.reportNoSpeech, true);
 });
+
+test("video notes are dated by recording time, voice notes by arrival", () => {
+  // Autosync carries the phone's mtime over to Drive's modified time, and the
+  // extractor stamps each audio file with its video's. Without this a
+  // backfilled clip would be dated the day it was uploaded.
+  assert.strictEqual(SOURCES.video.datedBy, "modified");
+  assert.strictEqual(SOURCES.voice.datedBy, "created");
+});

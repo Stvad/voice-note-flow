@@ -145,9 +145,14 @@ const AUDIO_EXTENSIONS = [
 // What differs between the kinds of folder we watch. Video audio comes from
 // every clip the camera records, most of them with nobody talking, so silence
 // there is normal rather than worth a message.
+//
+// datedBy picks the Drive timestamp the note is dated by. The extractor stamps
+// each audio file with its video's mtime and Autosync carries that over as
+// Drive's modified time, so for video it is the recording time, even for a
+// clip backfilled days later.
 const SOURCES = {
-  voice: { footer: "", reportNoSpeech: true },
-  video: { footer: "\n- source:: [[video note]]", reportNoSpeech: false },
+  voice: { footer: "", reportNoSpeech: true, datedBy: "created" },
+  video: { footer: "\n- source:: [[video note]]", reportNoSpeech: false, datedBy: "modified" },
 };
 
 // meta: {url, name, timestamp, source}
@@ -532,12 +537,12 @@ const SUMMARY_THRESHOLD_CHARS = 1000;
 // source is "voice" or "video" (see SOURCES); it defaults to "voice".
 function processVoiceNote(file, config, source) {
   source = source || "voice";
-  const created = file.getDateCreated();
+  const when = SOURCES[source].datedBy === "modified" ? file.getLastUpdated() : file.getDateCreated();
   const tz = PropertiesService.getScriptProperties().getProperty("TIMEZONE") || "UTC";
   const footer = renderFooter_({
     url: file.getUrl(),
     name: file.getName(),
-    timestamp: Utilities.formatDate(created, tz, "dd/MM/yyyy HH:mm:ss z"),
+    timestamp: Utilities.formatDate(when, tz, "dd/MM/yyyy HH:mm:ss z"),
     source: source,
   });
 
