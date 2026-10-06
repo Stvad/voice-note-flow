@@ -20,7 +20,7 @@ How it behaves:
 - **Which videos:** videos recorded after the start date you give on the first
   run (step 5). Everything older is left alone.
 - **Silent clips:** clips with no speech post nothing to Matrix. Clips with
-  speech arrive tagged `source:: [[video note]]`.
+  speech arrive tagged `[[video note]]`.
 - **Note dates:** each note is dated by when the video was recorded, even when
   it's processed days later.
 - **Delay:** expect roughly 15–30 minutes from recording to the Matrix message.
@@ -176,7 +176,7 @@ unless you change these. Do this for each of **Termux**, **Termux:API** and
    ```
 4. Tap sync in Autosync, or wait for its interval.
 5. A minute or so after the file lands in Drive, a Matrix message tagged
-   `source:: [[video note]]` arrives, dated by when you recorded the video.
+   `[[video note]]` arrives, dated by when you recorded the video.
 
 ## 10. Schedule it
 

@@ -364,7 +364,9 @@ test("voice note footer is unchanged by the source split", () => {
 test("video note footer says where the audio came from", () => {
   const footer = renderFooter_(Object.assign({ source: "video" }, META));
 
-  assert.match(footer, /\n- source:: \[\[video note\]\]$/);
+  // A plain tag bullet: an attribute (source:: [[video note]]) does not work
+  // downstream.
+  assert.match(footer, /\n- \[\[video note\]\]$/);
   assert.ok(footer.startsWith(renderFooter_(Object.assign({ source: "voice" }, META))));
 });
 

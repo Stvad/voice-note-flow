@@ -152,7 +152,7 @@ const AUDIO_EXTENSIONS = [
 // clip backfilled days later.
 const SOURCES = {
   voice: { footer: "", reportNoSpeech: true, datedBy: "created" },
-  video: { footer: "\n- source:: [[video note]]", reportNoSpeech: false, datedBy: "modified" },
+  video: { footer: "\n- [[video note]]", reportNoSpeech: false, datedBy: "modified" },
 };
 
 // meta: {url, name, timestamp, source}
